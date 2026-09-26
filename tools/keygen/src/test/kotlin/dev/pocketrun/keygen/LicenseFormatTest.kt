@@ -1,6 +1,7 @@
 package dev.pocketrun.keygen
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -84,13 +85,15 @@ class LicenseFormatTest {
     }
 
     @Test
-    fun `a tampered payload no longer verifies`() {
+    fun `editing the payload invalidates the signature`() {
         val pair = Ed25519.keyPairFromSeed(Base64.getUrlDecoder().decode(Vector.SEED))
         val payload = LicenseFormat.encodePayload(Vector.CLAIMS)
         val signature = Ed25519.sign(pair.private, payload.toByteArray(StandardCharsets.UTF_8))
         val forged = LicenseFormat.assemble(payload.replace("pro", "max"), signature)
         val (forgedPayload, forgedSignature) = LicenseFormat.split(forged)
-        assertTrue(Ed25519.verify(pair.public, forgedPayload.toByteArray(StandardCharsets.UTF_8), forgedSignature))
+        assertFalse(
+            Ed25519.verify(pair.public, forgedPayload.toByteArray(StandardCharsets.UTF_8), forgedSignature),
+        )
     }
 }
 
@@ -123,7 +126,7 @@ class Ed25519Test {
         val message = "pocketrun".toByteArray(StandardCharsets.UTF_8)
         val signature = Ed25519.sign(signer.private, message)
         assertTrue(Ed25519.verify(signer.public, message, signature))
-        assertTrue(!Ed25519.verify(other.public, message, signature))
+        assertFalse(Ed25519.verify(other.public, message, signature))
     }
 
     @Test
@@ -132,6 +135,6 @@ class Ed25519Test {
         val message = "pocketrun".toByteArray(StandardCharsets.UTF_8)
         val signature = Ed25519.sign(pair.private, message)
         signature[0] = (signature[0].toInt() xor 0x01).toByte()
-        assertTrue(!Ed25519.verify(pair.public, message, signature))
+        assertFalse(Ed25519.verify(pair.public, message, signature))
     }
 }
