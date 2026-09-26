@@ -29,7 +29,7 @@ class LicenseManager(
             val fingerprint: String,
             val daysRemaining: Long?,
         ) : LicenseState {
-            val canUseAgent: Boolean get() = plan in AGENT_PLANS
+            val canUseAgent: Boolean get() = claims.plan in AGENT_PLANS
         }
 
         data class Rejected(val message: String) : LicenseState

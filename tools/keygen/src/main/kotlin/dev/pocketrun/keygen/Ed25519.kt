@@ -28,6 +28,16 @@ object Ed25519 {
 
     fun generateKeyPair(): KeyPair = keyPairFromSeed(randomSeed())
 
+    /**
+     * Returns the 32-byte seed together with its keypair. The seed is what gets
+     * stored in license.key; [java.security.PrivateKey.getEncoded] is not usable
+     * for that, so the seed is threaded through explicitly.
+     */
+    fun generate(): Pair<ByteArray, KeyPair> {
+        val seed = randomSeed()
+        return seed to keyPairFromSeed(seed)
+    }
+
     fun randomSeed(): ByteArray = ByteArray(32).also { random.nextBytes(it) }
 
     fun keyPairFromSeed(seed: ByteArray): KeyPair {

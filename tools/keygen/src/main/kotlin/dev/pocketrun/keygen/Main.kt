@@ -60,8 +60,8 @@ private fun genKey(options: Options) {
         kotlin.system.exitProcess(1)
     }
     out.mkdirs()
-    val pair = Ed25519.generateKeyPair()
-    privateFile.writeText(B64.encodeToString(pair.private.encoded))
+    val (seed, pair) = Ed25519.generate()
+    privateFile.writeText(B64.encodeToString(seed))
     publicFile.writeText(B64.encodeToString(Ed25519.encodePublicKey(pair.public)))
     println("private key -> ${privateFile.absolutePath}")
     println("public  key -> ${publicFile.absolutePath}")

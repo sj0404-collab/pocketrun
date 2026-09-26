@@ -16,7 +16,8 @@ import java.util.Base64
  * If either side drifts, one of the two builds fails.
  */
 object Vector {
-    const val SEED = "MC4CAQAwBQYDK2VwBCIEIAsSGSAnLjU8Q0pRWF9mbXR7gomQl56lrLO6wcjP1t3k"
+    /** ByteArray(32) { (it * 7 + 11).toByte() }; fixed so the vector is reproducible. */
+    val SEED: ByteArray = ByteArray(32) { (it * 7 + 11).toByte() }
     const val PUBLIC_KEY = "MCowBQYDK2VwAyEA14W0lYPuc2xmz1Xch0dPTzN8lxv8PWnLoeIeZ3Y2U68"
     const val PAYLOAD_SHA256 = "Kp-KE-mFSu3_E8uWyTPGuv8yNWimNLw2gP_qKVUBAY0"
     const val LICENSE_KEY =
@@ -60,7 +61,7 @@ class LicenseFormatTest {
 
     @Test
     fun `signing the golden claims reproduces the golden key`() {
-        val pair = Ed25519.keyPairFromSeed(Base64.getUrlDecoder().decode(Vector.SEED))
+        val pair = Ed25519.keyPairFromSeed(Vector.SEED)
         val payload = LicenseFormat.encodePayload(Vector.CLAIMS)
         val signature = Ed25519.sign(pair.private, payload.toByteArray(StandardCharsets.UTF_8))
         assertEquals(Vector.LICENSE_KEY, LicenseFormat.assemble(payload, signature))
@@ -86,7 +87,7 @@ class LicenseFormatTest {
 
     @Test
     fun `editing the payload invalidates the signature`() {
-        val pair = Ed25519.keyPairFromSeed(Base64.getUrlDecoder().decode(Vector.SEED))
+        val pair = Ed25519.keyPairFromSeed(Vector.SEED)
         val payload = LicenseFormat.encodePayload(Vector.CLAIMS)
         val signature = Ed25519.sign(pair.private, payload.toByteArray(StandardCharsets.UTF_8))
         val forged = LicenseFormat.assemble(payload.replace("pro", "max"), signature)
@@ -101,7 +102,7 @@ class Ed25519Test {
 
     @Test
     fun `seed derives the golden public key`() {
-        val pair = Ed25519.keyPairFromSeed(Base64.getUrlDecoder().decode(Vector.SEED))
+        val pair = Ed25519.keyPairFromSeed(Vector.SEED)
         assertEquals(
             Vector.PUBLIC_KEY,
             Base64.getUrlEncoder().withoutPadding().encodeToString(Ed25519.encodePublicKey(pair.public)),
