@@ -1,6 +1,7 @@
 package dev.pocketrun.license
 
 import net.i2p.crypto.eddsa.EdDSAPrivateKey
+import net.i2p.crypto.eddsa.EdDSAPublicKey
 import net.i2p.crypto.eddsa.EdDSASecurityProvider
 import net.i2p.crypto.eddsa.spec.EdDSANamedCurveTable
 import net.i2p.crypto.eddsa.spec.EdDSAPrivateKeySpec
@@ -24,7 +25,12 @@ internal object Ed25519 {
         .getInstance("EdDSA", provider)
         .generatePublic(EdDSAPublicKeySpec(encoded, spec))
 
-    fun encodePublicKey(publicKey: PublicKey): ByteArray = publicKey.encoded
+    /**
+     * The 32 raw key bytes. [java.security.PublicKey.getEncoded] would give the
+     * 44-byte X.509 SubjectPublicKeyInfo, which is not what gets embedded in the
+     * app and not what [publicKeyFromRaw] accepts.
+     */
+    fun encodePublicKey(publicKey: PublicKey): ByteArray = (publicKey as EdDSAPublicKey).abyte
 
     fun publicKeyOf(privateKey: PrivateKey): PublicKey = KeyFactory
         .getInstance("EdDSA", provider)

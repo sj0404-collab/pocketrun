@@ -16,7 +16,7 @@ import java.util.Base64
  */
 object Vector {
     const val SEED = "MC4CAQAwBQYDK2VwBCIEIAsSGSAnLjU8Q0pRWF9mbXR7gomQl56lrLO6wcjP1t3k"
-    const val PUBLIC_KEY = "MCowBQYDK2VwAyEA14W0lYPuc2xmz1Xch0dPTzN8lxv8PWnLoeIeZ3Y2U68"
+    const val PUBLIC_KEY = "14W0lYPuc2xmz1Xch0dPTzN8lxv8PWnLoeIeZ3Y2U68"
     const val PAYLOAD_SHA256 = "Kp-KE-mFSu3_E8uWyTPGuv8yNWimNLw2gP_qKVUBAY0"
     const val LICENSE_KEY =
         "PRK1.UFJLMQpuYW1lPVRlc3QgVXNlcgpzZWF0PXNlYXQtMQpwbGFuPXBybwpuYmY9MTcwMDAwMDAw" +

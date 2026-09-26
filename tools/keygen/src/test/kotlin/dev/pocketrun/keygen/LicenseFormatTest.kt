@@ -18,7 +18,7 @@ import java.util.Base64
 object Vector {
     /** ByteArray(32) { (it * 7 + 11).toByte() }; fixed so the vector is reproducible. */
     val SEED: ByteArray = ByteArray(32) { (it * 7 + 11).toByte() }
-    const val PUBLIC_KEY = "MCowBQYDK2VwAyEA14W0lYPuc2xmz1Xch0dPTzN8lxv8PWnLoeIeZ3Y2U68"
+    const val PUBLIC_KEY = "14W0lYPuc2xmz1Xch0dPTzN8lxv8PWnLoeIeZ3Y2U68"
     const val PAYLOAD_SHA256 = "Kp-KE-mFSu3_E8uWyTPGuv8yNWimNLw2gP_qKVUBAY0"
     const val LICENSE_KEY =
         "PRK1.UFJLMQpuYW1lPVRlc3QgVXNlcgpzZWF0PXNlYXQtMQpwbGFuPXBybwpuYmY9MTcwMDAwMDAw" +
