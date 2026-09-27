@@ -30,6 +30,12 @@ jobs:
           distribution: temurin
           java-version: "17"
 
+      # Chaquopy needs a build machine Python matching the app's major.minor
+      # version to precompile .pyc; ubuntu-24.04's default is 3.12.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
       - uses: gradle/actions/setup-gradle@v4
 
       - name: Cache Chaquopy downloads

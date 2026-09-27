@@ -45,7 +45,10 @@ Node-совместимый слой: `require` с резолвом `node_module
 
 ### 2.2 Python
 
-Chaquopy 17.0.0 (плагин) + `com.chaquo.python:python:3.13.15`.
+Chaquopy 17.0.0 (плагин), CPython 3.13. Версия Python выбирается блоком
+`chaquopy { defaultConfig { version = "3.13" } }` в `android/app/build.gradle.kts`;
+зависимость `com.chaquo.python:python` для этого не работает — Chaquopy 17 её
+игнорирует и молча собирает дефолтный 3.10 (так было до сентября 2026).
 Плагин не публикует marker-артефакт, поэтому в `settings.gradle.kts` есть
 `resolutionStrategy.eachPlugin` с `useModule("com.chaquo.python:gradle:...")`.
 
@@ -62,7 +65,9 @@ dependencies { /* ... */ }
 
 Предупреждение сборки `Failed to compile to .pyc format: Couldn't find Python 3.10`
 безвредно: на машине сборки нет CPython 3.10, Chaquopy просто не предкомпилирует
-*.pyc* и интерпретирует исходники. На устройство это не влияет.
+*.pyc* и интерпретирует исходники. На устройство это не влияет. С сентября 2026 в CI
+стоит `actions/setup-python` с 3.13, совпадающим с версией приложения, поэтому
+*.pyc* компилируется и это предупреждение ушло.
 
 ### 2.3 Формат лицензионного ключа
 
