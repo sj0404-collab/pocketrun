@@ -2,6 +2,7 @@ package dev.pocketrun.ui
 
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
@@ -46,6 +47,7 @@ import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -109,6 +111,13 @@ fun AgentScreen(viewModel: AppViewModel) {
     val listState = rememberLazyListState()
     LaunchedEffect(messages.size) {
         if (messages.isNotEmpty()) listState.animateScrollToItem(messages.size - 1)
+    }
+    // When a question or approval appears, show the end of the chat so the
+    // card (and its buttons) is on screen.
+    LaunchedEffect(pendingQuestion != null, pendingApproval != null) {
+        if ((pendingQuestion != null || pendingApproval != null) && messages.isNotEmpty()) {
+            listState.animateScrollToItem(messages.size - 1)
+        }
     }
 
     // File attachment: any file → copied into the project and sent to the agent.
@@ -241,9 +250,10 @@ fun AgentScreen(viewModel: AppViewModel) {
             verticalAlignment = Alignment.Bottom,
             modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
         ) {
+            val answering = pendingQuestion != null
             IconButton(
                 onClick = { filePicker.launch(arrayOf("*/*")) },
-                enabled = !running,
+                enabled = !running && !answering,
             ) {
                 Icon(Icons.Filled.AttachFile, contentDescription = "Отправить файл агенту")
             }
@@ -252,24 +262,42 @@ fun AgentScreen(viewModel: AppViewModel) {
                 value = input,
                 onValueChange = { input = it },
                 modifier = Modifier.weight(1f),
-                placeholder = { Text("Спросите агента… /help — справка") },
+                placeholder = { Text(if (answering) "Ваш ответ агенту…" else "Спросите агента… /help — справка") },
                 maxLines = 4,
-                enabled = !running,
+                enabled = !running || answering,
             )
             Spacer(Modifier.width(8.dp))
-            if (running) {
-                Button(onClick = viewModel::cancelAgent) {
-                    Icon(Icons.Filled.Stop, contentDescription = "Остановить (сессия сохранится)")
+            when {
+                // The agent is blocked on a question: the main input answers it.
+                answering -> {
+                    Button(
+                        onClick = {
+                            pendingQuestion?.answer?.invoke(input.ifBlank { "(нет ответа)" })
+                            input = ""
+                        },
+                        enabled = input.isNotBlank(),
+                    ) {
+                        Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Отправить ответ")
+                    }
+                    IconButton(onClick = viewModel::cancelAgent) {
+                        Icon(Icons.Filled.Stop, contentDescription = "Остановить")
+                    }
                 }
-            } else {
-                Button(
-                    onClick = {
-                        viewModel.sendToAgent(input)
-                        input = ""
-                    },
-                    enabled = input.isNotBlank(),
-                ) {
-                    Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Отправить")
+                running -> {
+                    Button(onClick = viewModel::cancelAgent) {
+                        Icon(Icons.Filled.Stop, contentDescription = "Остановить (сессия сохранится)")
+                    }
+                }
+                else -> {
+                    Button(
+                        onClick = {
+                            viewModel.sendToAgent(input)
+                            input = ""
+                        },
+                        enabled = input.isNotBlank(),
+                    ) {
+                        Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Отправить")
+                    }
                 }
             }
         }
@@ -382,9 +410,18 @@ private fun ApprovalCard(pa: AppViewModel.PendingApproval) {
                     overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
                 )
             }
-            Row(horizontalArrangement = Arrangement.End, modifier = Modifier.fillMaxWidth()) {
-                TextButton(onClick = { pa.respond(false) }) { Text("Отклонить") }
-                TextButton(onClick = { pa.respond(true) }) { Text("Разрешить") }
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                OutlinedButton(
+                    onClick = { pa.respond(false) },
+                    modifier = Modifier.weight(1f),
+                ) { Text("Отклонить", color = MaterialTheme.colorScheme.error) }
+                Button(
+                    onClick = { pa.respond(true) },
+                    modifier = Modifier.weight(1f),
+                ) { Text("Разрешить") }
             }
         }
     }
@@ -392,70 +429,103 @@ private fun ApprovalCard(pa: AppViewModel.PendingApproval) {
 
 // ----------------------------------------------------------------- question
 
+/**
+ * The agent is blocked on clarifying questions. The submit button is a
+ * full-width filled Button that is ALWAYS enabled; a single multiple-choice
+ * question submits instantly on tap.
+ */
 @Composable
 private fun QuestionCard(pq: AppViewModel.PendingQuestion) {
     val answers = remember(pq) { mutableStateOf(List(pq.questions.size) { "" }) }
+    val instantSubmit = pq.questions.size == 1 && pq.questions.first().options.isNotEmpty()
+
+    fun submit() {
+        val text = if (pq.questions.size == 1) {
+            answers.value[0].ifBlank { "(нет ответа)" }
+        } else {
+            pq.questions.mapIndexed { i, q -> "${i + 1}. ${q.question.take(60)} → ${answers.value[i].ifBlank { "(нет ответа)" }}" }
+                .joinToString("\n")
+        }
+        pq.answer(text)
+    }
 
     Surface(
         color = MaterialTheme.colorScheme.tertiaryContainer,
         shape = RoundedCornerShape(16.dp),
         modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
     ) {
-        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            pq.questions.forEachIndexed { qi, question ->
-                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                    question.header?.let {
-                        Text(it, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onTertiaryContainer)
-                    }
-                    Text(question.question, style = MaterialTheme.typography.bodyMedium)
-                    if (question.options.isNotEmpty()) {
-                        Column {
+        Column(Modifier.padding(12.dp)) {
+            Text(
+                "🤖 Агент ждёт вашего ответа",
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onTertiaryContainer,
+            )
+            Spacer(Modifier.height(8.dp))
+            // Bounded, scrollable question area — the submit button always
+            // stays visible below it, even with the keyboard open.
+            Column(
+                modifier = Modifier
+                    .heightIn(max = 260.dp)
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                pq.questions.forEachIndexed { qi, question ->
+                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        question.header?.let {
+                            Text(it, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onTertiaryContainer)
+                        }
+                        Text(question.question, style = MaterialTheme.typography.bodyMedium)
+                        if (question.options.isNotEmpty()) {
+                            Text(
+                                if (instantSubmit) "Нажмите вариант — ответ уйдёт сразу:" else "Выберите вариант:",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
                             question.options.forEach { option ->
                                 val selected = answers.value[qi] == option
                                 Surface(
-                                    color = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surface.copy(alpha = 0.5f),
+                                    color = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surface,
                                     shape = RoundedCornerShape(8.dp),
+                                    border = if (selected) BorderStroke(2.dp, MaterialTheme.colorScheme.primary) else null,
                                     modifier = Modifier
                                         .fillMaxWidth()
                                         .padding(vertical = 2.dp)
                                         .clickable {
                                             answers.value = answers.value.toMutableList().also { it[qi] = option }
+                                            if (instantSubmit) pq.answer(option)
                                         },
                                 ) {
-                                    Text(
-                                        option,
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = if (selected) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurface,
-                                        modifier = Modifier.padding(8.dp),
-                                    )
+                                    Row(Modifier.padding(10.dp), verticalAlignment = Alignment.CenterVertically) {
+                                        Text(
+                                            if (selected) "◉" else "○",
+                                            color = if (selected) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurfaceVariant,
+                                        )
+                                        Spacer(Modifier.width(8.dp))
+                                        Text(
+                                            option,
+                                            style = MaterialTheme.typography.bodyMedium,
+                                            color = if (selected) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurface,
+                                        )
+                                    }
                                 }
                             }
+                        } else {
+                            OutlinedTextField(
+                                value = answers.value[qi],
+                                onValueChange = { text -> answers.value = answers.value.toMutableList().also { it[qi] = text } },
+                                modifier = Modifier.fillMaxWidth(),
+                                placeholder = { Text("ваш ответ…") },
+                                singleLine = true,
+                            )
                         }
-                    } else {
-                        OutlinedTextField(
-                            value = answers.value[qi],
-                            onValueChange = { text -> answers.value = answers.value.toMutableList().also { it[qi] = text } },
-                            modifier = Modifier.fillMaxWidth(),
-                            placeholder = { Text("ваш ответ…") },
-                            singleLine = true,
-                        )
                     }
                 }
             }
-            Row(horizontalArrangement = Arrangement.End, modifier = Modifier.fillMaxWidth()) {
-                TextButton(
-                    onClick = {
-                        val text = if (pq.questions.size == 1) {
-                            answers.value[0].ifBlank { "(пусто)" }
-                        } else {
-                            pq.questions.mapIndexed { i, q -> "${i + 1}. ${q.question.take(60)} → ${answers.value[i].ifBlank { "(нет ответа)" }}" }
-                                .joinToString("\n")
-                        }
-                        pq.answer(text)
-                    },
-                    enabled = answers.value.any { it.isNotBlank() },
-                ) { Text("Ответить") }
-            }
+            Spacer(Modifier.height(10.dp))
+            Button(
+                onClick = { submit() },
+                modifier = Modifier.fillMaxWidth(),
+            ) { Text(if (instantSubmit) "Ответить своим текстом" else "Ответить агенту") }
         }
     }
 }
