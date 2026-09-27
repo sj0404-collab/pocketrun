@@ -13,12 +13,12 @@ CI: `.github/workflows/android.yml` — сборка APK и тесты в GitHub
 
 | Слой | Реализация | Состояние |
 |---|---|---|
-| Python | настоящий CPython 3.13 через Chaquopy | бутстрап написан, Kotlin-мост в работе |
+| Python | настоящий CPython 3.13 через Chaquopy | бутстрап + Kotlin-мост `PythonRuntime` готовы |
 | Node.js | Rhino + собственный Node-совместимый слой | не начато |
 | npx | свой: реестр npm + распаковка tar + запуск `bin` | не начато |
 | opencode | переписан на Kotlin: агент + инструменты + LLM-клиент | не начато |
 | Релиз-ключ | Ed25519, офлайн-проверка, утилита keygen | **готово** |
-| Интерфейс | Jetpack Compose | заглушка |
+| Интерфейс | Jetpack Compose | MVP: активация → проекты → редактор+терминал → инфо |
 
 Ключевое ограничение, определившее архитектуру: **это Android без Termux**, то есть
 нет Linux-пространства пользователя. Отсюда решения ниже.
@@ -161,18 +161,18 @@ tools/keygen/                         отдельный JVM-проект: genke
 
 Порядок именно такой — каждый пункт опирается на предыдущий.
 
-### 4.1 Python-мост (следующий шаг)
+### 4.1 Python-мост (следующий шаг) ✅ готово (v1.1.0)
 
 `runtime/python/PythonRuntime.kt`:
-* `Python.start(AndroidPlatform(context))` один раз, в `Application.onCreate` на
-  фоновом потоке — старт занимает около секунды;
-* `execute()` создаёт `out_path`/`err_path`, поднимает два `OutputTailer`,
-  вызывает `pocketrun.run(script, argsJson, stdin, out, err, cwd)`, возвращает
-  `ExecResult`;
-* `isAvailable()` и `version` читаются из `pocketrun.interpreter_info()`;
+* `initAsync()` стартует `Python.start(AndroidPlatform(context))` один раз, из
+  `PocketRunApplication.onCreate` на фоновом потоке — старт занимает около секунды;
+* `execute()` создаёт `out_path`/`err_path` в `workspace/cache/runs/<id>`,
+  поднимает два `OutputTailer`, вызывает `pocketrun.run(script, argsJson, stdin,
+  out, err, cwd)`, возвращает `ExecResult`;
+* `isAvailable()` и `version()` читаются из `pocketrun.interpreter_info()`;
 * **ограничение отмены:** Chaquopy не умеет прерывать вызов. `cancel()` ставит
   флаг, и по возвращению выдаётся код 130. Убийство процесса невозможно —
-  это надо честно показать в UI.
+  это честно показано в UI.
 
 ### 4.2 Node-совместимый слой
 

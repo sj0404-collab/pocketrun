@@ -16,7 +16,8 @@ class Workspace private constructor(val root: File) {
     val logs: File get() = File(root, "logs").apply { mkdirs() }
 
     fun projectDir(name: String): File {
-        val safe = name.replace(Regex("[^A-Za-z0-9._-]"), "_").trim('.', '_')
+        // Unicode letters and digits survive, everything else becomes '_'.
+        val safe = name.replace(Regex("[^\\p{L}\\p{N}._-]"), "_").trim('.', '_')
             .ifEmpty { "project" }
         return File(projects, safe).apply { mkdirs() }
     }
