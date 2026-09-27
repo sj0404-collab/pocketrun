@@ -31,7 +31,12 @@ object AgentSettings {
         val apiKey: String = "",
         val model: String = DEFAULT_MODEL,
     ) {
-        val isReady: Boolean get() = apiKey.isNotBlank() && baseUrl.isNotBlank() && model.isNotBlank()
+        /**
+         * The API key is optional: local servers (llama.cpp, vLLM) need none,
+         * and for Zen the server itself answers 403 without one — which the
+         * agent surfaces with a hint. Only URL and model are required.
+         */
+        val isReady: Boolean get() = baseUrl.isNotBlank() && model.isNotBlank()
         val endpoint: String get() = baseUrl.trimEnd('/') + "/chat/completions"
         val isZen: Boolean get() = baseUrl.contains("opencode.ai/zen")
     }

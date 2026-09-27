@@ -308,7 +308,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
         val config = _llmConfig.value
         if (!config.isReady) {
-            _agentMessages.update { it + AgentItem.Info("Сначала настройте модель: базовый URL, API-ключ и имя модели (кнопка ⚙ над чатом).") }
+            _agentMessages.update { it + AgentItem.Info("Сначала настройте модель: базовый URL и имя модели (кнопка ⚙ над чатом). API-ключ не нужен для локальных серверов; для Zen — бесплатный ключ с opencode.ai/auth.") }
             return false
         }
         return true
@@ -369,8 +369,19 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                         _agentMessages.update { it + AgentItem.Info("агент ждёт ответа на вопрос…") }
                     is OpenCodeAgent.Event.Todos ->
                         _todos.value = event.todos
-                    is OpenCodeAgent.Event.Failed ->
+                    is OpenCodeAgent.Event.Failed -> {
                         _agentMessages.update { it + AgentItem.Error(event.message) }
+                        // Zen refuses keyless requests with 403 even for free
+                        // models — tell the user where the free key lives.
+                        if (config.isZen && "403" in event.message) {
+                            _agentMessages.update {
+                                it + AgentItem.Info(
+                                    "Zen требует ключ даже для бесплатных моделей — получите его бесплатно на opencode.ai/auth " +
+                                        "(кнопка ⚙ над чатом). Бесплатные модели не расходуют кредиты.",
+                                )
+                            }
+                        }
+                    }
                 }
             }
 

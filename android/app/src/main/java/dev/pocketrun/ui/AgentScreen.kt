@@ -541,7 +541,7 @@ private fun LlmSettingsDialog(
                     label = { Text("Base URL") },
                     supportingText = {
                         Text(
-                            if (baseUrl.contains("opencode.ai/zen")) "ключ — на opencode.ai/auth"
+                            if (baseUrl.contains("opencode.ai/zen")) "ключ бесплатный на opencode.ai/auth — нужен даже бесплатным моделям"
                             else "например https://api.openai.com/v1",
                         )
                     },
@@ -550,10 +550,26 @@ private fun LlmSettingsDialog(
                 OutlinedTextField(
                     value = apiKey,
                     onValueChange = { apiKey = it },
-                    label = { Text("API-ключ") },
+                    label = { Text("API-ключ (не обязателен)") },
+                    supportingText = {
+                        if (apiKey.isBlank()) Text("без ключа — только локальные серверы; Zen ответит 403")
+                    },
                     singleLine = true,
                     visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation(),
                 )
+                if (baseUrl.contains("opencode.ai/zen")) {
+                    val context = androidx.compose.ui.platform.LocalContext.current
+                    TextButton(onClick = {
+                        runCatching {
+                            context.startActivity(
+                                android.content.Intent(
+                                    android.content.Intent.ACTION_VIEW,
+                                    android.net.Uri.parse("https://opencode.ai/auth"),
+                                ),
+                            )
+                        }
+                    }) { Text("Получить бесплатный ключ → opencode.ai/auth") }
+                }
                 OutlinedTextField(
                     value = model,
                     onValueChange = { model = it },

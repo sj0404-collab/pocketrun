@@ -65,7 +65,11 @@ class LlmClient(private val config: AgentSettings.Config) {
             readTimeout = 300_000 // models can think for a while before answering
             doOutput = true
             setRequestProperty("Content-Type", "application/json")
-            setRequestProperty("Authorization", "Bearer ${config.apiKey}")
+            // No Authorization header without a key: local servers reject
+            // stray headers far less often than cloud ones reject bad keys.
+            if (config.apiKey.isNotBlank()) {
+                setRequestProperty("Authorization", "Bearer ${config.apiKey}")
+            }
         }
         conn.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
 
