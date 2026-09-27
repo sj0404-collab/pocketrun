@@ -12,6 +12,20 @@ object AgentSettings {
     const val DEFAULT_BASE_URL = "https://api.openai.com/v1"
     const val DEFAULT_MODEL = "gpt-4o-mini"
 
+    /** opencode Zen: the curated OpenAI-compatible gateway from opencode.ai/auth. */
+    const val ZEN_BASE_URL = "https://opencode.ai/zen/v1"
+    const val ZEN_AUTH_URL = "https://opencode.ai/auth"
+
+    /** Ready-made presets shown in the model settings dialog. */
+    data class Preset(val label: String, val baseUrl: String, val model: String)
+
+    val PRESETS = listOf(
+        Preset("OpenCode Zen", ZEN_BASE_URL, "claude-sonnet-4-5"),
+        Preset("OpenAI", "https://api.openai.com/v1", "gpt-4o-mini"),
+        Preset("OpenRouter", "https://openrouter.ai/api/v1", "anthropic/claude-sonnet-4.5"),
+        Preset("Groq", "https://api.groq.com/openai/v1", "llama-3.3-70b-versatile"),
+    )
+
     data class Config(
         val baseUrl: String = DEFAULT_BASE_URL,
         val apiKey: String = "",
@@ -19,6 +33,7 @@ object AgentSettings {
     ) {
         val isReady: Boolean get() = apiKey.isNotBlank() && baseUrl.isNotBlank() && model.isNotBlank()
         val endpoint: String get() = baseUrl.trimEnd('/') + "/chat/completions"
+        val isZen: Boolean get() = baseUrl.contains("opencode.ai/zen")
     }
 
     private const val PREFS = "agent"

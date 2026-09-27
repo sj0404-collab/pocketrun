@@ -3,10 +3,11 @@ package dev.pocketrun.ui
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import dev.pocketrun.BuildConfig
-import dev.pocketrun.agent.Agent
 import dev.pocketrun.agent.AgentSettings
-import dev.pocketrun.agent.AgentTools
 import dev.pocketrun.agent.LlmClient
+import dev.pocketrun.agent.opencode.OpenCodeAgent
+import dev.pocketrun.agent.opencode.OpenCodeTools
+import dev.pocketrun.agent.opencode.Sessions
 import dev.pocketrun.core.Workspace
 import dev.pocketrun.license.LicenseManager
 import dev.pocketrun.runtime.ExecRequest
@@ -23,8 +24,10 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import org.json.JSONArray
 import java.io.File
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -120,10 +123,40 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private val _llmConfig = MutableStateFlow(AgentSettings.read(app))
     val llmConfig: StateFlow<AgentSettings.Config> = _llmConfig.asStateFlow()
 
+    /** Sessions: the opencode-style local session store. */
+    val sessions = Sessions(workspace)
+
+    private val _sessionList = MutableStateFlow<List<Sessions.SessionInfo>>(emptyList())
+    val sessionList: StateFlow<List<Sessions.SessionInfo>> = _sessionList.asStateFlow()
+
+    private val _currentSession = MutableStateFlow<Sessions.SessionInfo?>(null)
+    val currentSession: StateFlow<Sessions.SessionInfo?> = _currentSession.asStateFlow()
+
+    private val _todos = MutableStateFlow<List<Sessions.Todo>>(emptyList())
+    val todos: StateFlow<List<Sessions.Todo>> = _todos.asStateFlow()
+
+    /** A question the agent is blocked on, waiting for the user's answer. */
+    data class PendingQuestion(
+        val questions: List<OpenCodeTools.Question>,
+        val answer: (String) -> Unit,
+    )
+
+    private val _pendingQuestion = MutableStateFlow<PendingQuestion?>(null)
+    val pendingQuestion: StateFlow<PendingQuestion?> = _pendingQuestion.asStateFlow()
+
+    /** Model catalog loaded from the configured server (GET /models). */
+    private val _modelCatalog = MutableStateFlow<List<String>>(emptyList())
+    val modelCatalog: StateFlow<List<String>> = _modelCatalog.asStateFlow()
+
+    private val _modelCatalogState = MutableStateFlow<String?>(null)
+    val modelCatalogState: StateFlow<String?> = _modelCatalogState.asStateFlow()
+
     private val agentExecutor: ExecutorService =
         Executors.newSingleThreadExecutor { r -> Thread(r, "pocketrun-agent").apply { isDaemon = true } }
 
-    private var agentHistory = JSONArray()
+    private val ioExecutor: ExecutorService =
+        Executors.newSingleThreadExecutor { r -> Thread(r, "pocketrun-io").apply { isDaemon = true } }
+
     private val agentCancelled = AtomicBoolean(false)
 
     fun canUseAgent(): Boolean =
@@ -134,55 +167,241 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         _llmConfig.value = config
     }
 
+    /** GET {baseUrl}/models — the Zen catalog for the Zen preset. */
+    fun fetchModelCatalog(baseUrl: String, apiKey: String) {
+        _modelCatalogState.value = "загрузка…"
+        ioExecutor.execute {
+            try {
+                val models = LlmClient.models(baseUrl, apiKey)
+                _modelCatalog.value = models
+                _modelCatalogState.value = if (models.isEmpty()) "сервер не вернул моделей" else null
+            } catch (t: Throwable) {
+                _modelCatalog.value = emptyList()
+                _modelCatalogState.value = t.message ?: t.javaClass.simpleName
+            }
+        }
+    }
+
     fun clearAgentChat() {
         if (_agentRunning.value) return
-        agentHistory = JSONArray()
         _agentMessages.value = emptyList()
+        _todos.value = emptyList()
+        _pendingQuestion.value = null
+    }
+
+    fun refreshSessions() {
+        _sessionList.value = sessions.list()
+    }
+
+    private fun projectName(): String? = _selected.value?.name
+
+    /** `/new` — starts a fresh session for the current project. */
+    fun newSession() {
+        if (_agentRunning.value) return
+        val session = sessions.create(project = projectName(), title = null, model = _llmConfig.value.model)
+        _currentSession.value = session.info
+        _agentMessages.value = emptyList()
+        _todos.value = emptyList()
+        refreshSessions()
+    }
+
+    /** Resumes a stored session: history and todos come back into the chat. */
+    fun openSession(id: String) {
+        if (_agentRunning.value) return
+        val session = sessions.load(id) ?: return
+        _currentSession.value = session.info
+        _todos.value = session.todos
+        _agentMessages.value = historyToItems(session.messages)
+        refreshSessions()
+    }
+
+    fun forkSession(id: String) {
+        if (_agentRunning.value) return
+        sessions.fork(id)?.let { child ->
+            _currentSession.value = child.info
+            _todos.value = child.todos
+            _agentMessages.value = historyToItems(child.messages)
+        }
+        refreshSessions()
+    }
+
+    fun renameSession(id: String, title: String) {
+        sessions.rename(id, title)
+        if (_currentSession.value?.id == id) _currentSession.value = sessions.list().firstOrNull { it.id == id } ?: _currentSession.value
+        refreshSessions()
+    }
+
+    fun deleteSession(id: String) {
+        sessions.delete(id)
+        if (_currentSession.value?.id == id) {
+            _currentSession.value = null
+            _agentMessages.value = emptyList()
+            _todos.value = emptyList()
+        }
+        refreshSessions()
+    }
+
+    /** `opencode export` analog: writes the session to opencode-data/exports/. */
+    fun exportSession(id: String) {
+        val path = sessions.export(id)
+        _agentMessages.update {
+            it + AgentItem.Info(
+                if (path != null) "Сессия сохранена: $path"
+                else "Не удалось экспортировать сессию",
+            )
+        }
+    }
+
+    private fun historyToItems(messages: JSONArray): List<AgentItem> {
+        val items = mutableListOf<AgentItem>()
+        for (i in 0 until messages.length()) {
+            val m = messages.optJSONObject(i) ?: continue
+            when (m.optString("role")) {
+                "user" -> m.optString("content").takeIf { it.isNotBlank() }?.let { items += AgentItem.User(it) }
+                "assistant" -> {
+                    m.optString("content").takeIf { it.isNotBlank() }?.let { items += AgentItem.Assistant(it) }
+                    val calls = m.optJSONArray("tool_calls")
+                    if (calls != null) {
+                        for (c in 0 until calls.length()) {
+                            val fn = calls.optJSONObject(c)?.optJSONObject("function") ?: continue
+                            items += AgentItem.Tool(fn.optString("name"), fn.optString("arguments").take(120), "")
+                        }
+                    }
+                }
+            }
+        }
+        return items
     }
 
     fun sendToAgent(text: String) {
         val prompt = text.trim()
         if (prompt.isEmpty() || _agentRunning.value) return
+
+        // Chat commands, opencode-style.
+        when (prompt) {
+            "/new" -> {
+                newSession()
+                _agentMessages.update { it + AgentItem.Info("Новая сессия${projectName()?.let { " для проекта $it" } ?: ""}.") }
+                return
+            }
+            "/init" -> {
+                if (!requireConfigured()) return
+                _agentMessages.update { it + AgentItem.User("/init") }
+                runAgentTurn(
+                    "Create an AGENTS.md file in the current project root: briefly describe the project " +
+                        "(look at the files first) and add short, useful rules for future agents working in it. " +
+                        "Keep it under 30 lines. Reply with a one-line summary.",
+                )
+                return
+            }
+        }
+
+        if (!requireConfigured()) return
+        _agentMessages.update { it + AgentItem.User(prompt) }
+        runAgentTurn(prompt)
+    }
+
+    private fun requireConfigured(): Boolean {
         if (!canUseAgent()) {
             _agentMessages.update { it + AgentItem.Error("Агент доступен на плане Pro — активируйте Pro-лицензию.") }
-            return
+            return false
         }
         val config = _llmConfig.value
         if (!config.isReady) {
             _agentMessages.update { it + AgentItem.Info("Сначала настройте модель: базовый URL, API-ключ и имя модели (кнопка ⚙ над чатом).") }
-            return
+            return false
         }
-        _agentMessages.update { it + AgentItem.User(prompt) }
+        return true
+    }
+
+    private fun runAgentTurn(userText: String) {
+        val config = _llmConfig.value
+        if (!config.isReady) return
         _agentRunning.value = true
         agentCancelled.set(false)
 
         agentExecutor.execute {
-            val tools = AgentTools(workspace, jsRuntime, npxRuntime)
-            val agent = Agent(tools, { LlmClient(config) })
+            val projectDir = _selected.value?.dir
+            val tools = OpenCodeTools(workspace, jsRuntime, npxRuntime, projectDir)
+            val agent = OpenCodeAgent(workspace, tools, { LlmClient(config) }, projectDir)
+
+            // The session this turn belongs to; create one on demand.
+            val session = _currentSession.value?.let { sessions.load(it.id) }
+                ?: sessions.create(project = projectName(), title = null, model = config.model)
+
+            // Question tool: block this thread until the user answers in the UI.
+            tools.questionAsker = { questions ->
+                val latch = CountDownLatch(1)
+                @Volatile var answer: String? = null
+                _pendingQuestion.value = PendingQuestion(questions) { text ->
+                    answer = text
+                    _pendingQuestion.value = null
+                    latch.countDown()
+                }
+                if (!latch.await(10, TimeUnit.MINUTES)) {
+                    _pendingQuestion.value = null
+                    return@questionAsker "(ответа не последовало)"
+                }
+                answer ?: "(нет ответа)"
+            }
+
+            tools.onTodos = { list ->
+                session.todos = list
+                _todos.value = list
+            }
+            tools.todos = session.todos
+
             agent.cancelled = agentCancelled.get()
-            val newHistory = agent.run(prompt, agentHistory) { event ->
+            val newHistory = agent.run(userText, session.messages) { event ->
                 when (event) {
-                    is Agent.Event.AssistantText ->
+                    is OpenCodeAgent.Event.AssistantText ->
                         _agentMessages.update { it + AgentItem.Assistant(event.text) }
-                    is Agent.Event.ToolStart ->
+                    is OpenCodeAgent.Event.ToolStart ->
                         _agentMessages.update { it + AgentItem.Tool(event.name, event.args, null) }
-                    is Agent.Event.ToolDone ->
+                    is OpenCodeAgent.Event.ToolDone ->
                         _agentMessages.update { items ->
                             val idx = items.indexOfLast { it is AgentItem.Tool && it.result == null && it.name == event.name }
                             if (idx >= 0) items.toMutableList().also { list -> list[idx] = (list[idx] as AgentItem.Tool).copy(result = event.result) }
                             else items + AgentItem.Tool(event.name, "", event.result)
                         }
-                    is Agent.Event.Failed ->
+                    is OpenCodeAgent.Event.Question ->
+                        _agentMessages.update { it + AgentItem.Info("агент ждёт ответа на вопрос…") }
+                    is OpenCodeAgent.Event.Todos ->
+                        _todos.value = event.todos
+                    is OpenCodeAgent.Event.Failed ->
                         _agentMessages.update { it + AgentItem.Error(event.message) }
                 }
             }
-            agentHistory = newHistory
+
+            // Persist the turn: history, todos, auto-title from the first message.
+            session.messages = newHistory
+            session.info.model = config.model
+            if (session.info.title == "Новая сессия") {
+                val firstUser = firstUserText(newHistory) ?: userText
+                val auto = firstUser.replace('\n', ' ').trim().take(40).let { if (it.length == 40) it + "…" else it }
+                if (auto.isNotBlank()) session.info.title = auto
+            }
+            sessions.save(session)
+            _currentSession.value = session.info
+            refreshSessions()
             _agentRunning.value = false
         }
     }
 
+    private fun firstUserText(history: JSONArray): String? {
+        for (i in 0 until history.length()) {
+            val m = history.optJSONObject(i) ?: continue
+            if (m.optString("role") == "user") {
+                val c = m.optString("content")
+                if (c.isNotBlank() && !c.startsWith("Create an AGENTS.md")) return c
+            }
+        }
+        return null
+    }
+
     fun cancelAgent() {
         agentCancelled.set(true)
+        _pendingQuestion.value?.answer?.invoke("(отменено пользователем)")
     }
 
     // ---------------------------------------------------------------- projects

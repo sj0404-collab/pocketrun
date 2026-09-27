@@ -17,6 +17,37 @@ class LlmClient(private val config: AgentSettings.Config) {
 
     class LlmException(message: String) : Exception(message)
 
+    companion object {
+        /**
+         * Fetches the model list of an OpenAI-compatible server:
+         * GET {baseUrl}/models, parse data[].id. Used by the model settings UI
+         * (e.g. the OpenCode Zen catalog at https://opencode.ai/zen/v1).
+         */
+        fun models(baseUrl: String, apiKey: String): List<String> {
+            val url = baseUrl.trim().trimEnd('/') + "/models"
+            val conn = (URL(url).openConnection() as HttpURLConnection).apply {
+                requestMethod = "GET"
+                connectTimeout = 10_000
+                readTimeout = 30_000
+                setRequestProperty("Accept", "application/json")
+                if (apiKey.isNotBlank()) setRequestProperty("Authorization", "Bearer $apiKey")
+            }
+            val status = conn.responseCode
+            val text = (if (status in 200..299) conn.inputStream else conn.errorStream)
+                ?.bufferedReader(Charsets.UTF_8)?.use { it.readText() } ?: ""
+            if (status !in 200..299) {
+                throw LlmException("HTTP $status от $url: ${text.take(300)}")
+            }
+            val data = JSONObject(text).optJSONArray("data") ?: return emptyList()
+            val ids = mutableListOf<String>()
+            for (i in 0 until data.length()) {
+                val id = data.optJSONObject(i)?.optString("id").orEmpty()
+                if (id.isNotEmpty()) ids += id
+            }
+            return ids.sortedWith(compareBy<String> { it.lowercase() })
+        }
+    }
+
     fun chat(messages: JSONArray, tools: JSONArray?): Response {
         val body = JSONObject().apply {
             put("model", config.model)
