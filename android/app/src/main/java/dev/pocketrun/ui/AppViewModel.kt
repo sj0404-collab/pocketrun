@@ -332,17 +332,18 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             // Question tool: block this thread until the user answers in the UI.
             tools.questionAsker = { questions ->
                 val latch = CountDownLatch(1)
-                @Volatile var answer: String? = null
+                var answer: String? = null
                 _pendingQuestion.value = PendingQuestion(questions) { text ->
                     answer = text
                     _pendingQuestion.value = null
                     latch.countDown()
                 }
-                if (!latch.await(10, TimeUnit.MINUTES)) {
+                if (latch.await(10, TimeUnit.MINUTES)) {
+                    answer ?: "(нет ответа)"
+                } else {
                     _pendingQuestion.value = null
-                    return@questionAsker "(ответа не последовало)"
+                    "(ответа не последовало)"
                 }
-                answer ?: "(нет ответа)"
             }
 
             tools.onTodos = { list ->
