@@ -7,6 +7,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Code
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.SmartToy
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.NavigationBar
@@ -25,7 +26,7 @@ import androidx.compose.ui.Modifier
 import androidx.lifecycle.viewmodel.compose.viewModel
 import dev.pocketrun.license.LicenseManager
 
-/** Root: activation gate first, then the three-tab main screen. */
+/** Root: activation gate first, then the four-tab main screen. */
 @Composable
 fun PocketRunApp(viewModel: AppViewModel = viewModel()) {
     val license by viewModel.licenseState.collectAsState()
@@ -65,6 +66,12 @@ private fun MainScreen(viewModel: AppViewModel, license: LicenseManager.LicenseS
                 NavigationBarItem(
                     selected = tab == 2,
                     onClick = { tab = 2 },
+                    icon = { Icon(Icons.Filled.SmartToy, contentDescription = null) },
+                    label = { Text("Агент") },
+                )
+                NavigationBarItem(
+                    selected = tab == 3,
+                    onClick = { tab = 3 },
                     icon = { Icon(Icons.Filled.Info, contentDescription = null) },
                     label = { Text("Инфо") },
                 )
@@ -75,6 +82,7 @@ private fun MainScreen(viewModel: AppViewModel, license: LicenseManager.LicenseS
             when (tab) {
                 0 -> ProjectsScreen(viewModel)
                 1 -> EditorScreen(viewModel)
+                2 -> AgentScreen(viewModel)
                 else -> InfoScreen(viewModel, license)
             }
         }

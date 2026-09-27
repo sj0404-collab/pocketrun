@@ -55,5 +55,8 @@ class Workspace private constructor(val root: File) {
         fun from(context: Context): Workspace = Workspace(
             File(context.filesDir, "workspace"),
         )
+
+        /** JVM-friendly constructor for unit tests: the sandbox rooted at [dir]. */
+        fun at(dir: File): Workspace = Workspace(dir.apply { mkdirs() })
     }
 }

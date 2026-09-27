@@ -21,6 +21,7 @@ import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -42,17 +43,21 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import dev.pocketrun.runtime.OutputStream
+import dev.pocketrun.runtime.RuntimeKind
 
-/** Script editor on top, live run output below. */
+/** Script editor on top, live run output below. Three modes: Python, Node, npx. */
 @Composable
 fun EditorScreen(viewModel: AppViewModel) {
     val selected by viewModel.selected.collectAsState()
     val script by viewModel.script.collectAsState()
     val runState by viewModel.runState.collectAsState()
     val output by viewModel.output.collectAsState()
+    val mode by viewModel.editorModeFlow.collectAsState()
+    val npxCommand by viewModel.npxCommandFlow.collectAsState()
 
-    // Local editor state; reset when another project is opened.
-    var text by rememberSaveable(selected?.name) { mutableStateOf(script) }
+    // Local editor state; reset when another project or mode is opened.
+    var text by rememberSaveable(selected?.name, mode) { mutableStateOf(script) }
+    var npxText by rememberSaveable(selected?.name) { mutableStateOf(npxCommand) }
 
     if (selected == null) {
         Box(Modifier.fillMaxSize().padding(24.dp), contentAlignment = Alignment.Center) {
@@ -99,23 +104,76 @@ fun EditorScreen(viewModel: AppViewModel) {
         }
         Spacer(Modifier.height(8.dp))
 
-        OutlinedTextField(
-            value = text,
-            onValueChange = { text = it },
-            modifier = Modifier.fillMaxWidth().weight(1.2f),
-            textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
-            placeholder = { Text("print('Привет!')") },
-        )
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            FilterChip(
+                selected = mode == RuntimeKind.PYTHON,
+                onClick = { viewModel.setEditorMode(RuntimeKind.PYTHON) },
+                label = { Text("Python") },
+            )
+            FilterChip(
+                selected = mode == RuntimeKind.NODE,
+                onClick = { viewModel.setEditorMode(RuntimeKind.NODE) },
+                label = { Text("Node.js") },
+            )
+            FilterChip(
+                selected = mode == RuntimeKind.NPX,
+                onClick = { viewModel.setEditorMode(RuntimeKind.NPX) },
+                label = { Text("npx") },
+            )
+        }
+        Spacer(Modifier.height(8.dp))
+
+        if (mode == RuntimeKind.NPX) {
+            Column(Modifier.fillMaxWidth().weight(1.2f)) {
+                Text(
+                    "Запуск npm-пакета без установки окружения: чистые JS-пакеты скачиваются из registry.npmjs.org и выполняются в песочнице. Нативные модули и postinstall-скрипты не поддерживаются.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Spacer(Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = npxText,
+                    onValueChange = {
+                        npxText = it
+                        viewModel.npxCommand.value = it
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                    textStyle = MaterialTheme.typography.bodyMedium.copy(fontFamily = FontFamily.Monospace),
+                    placeholder = { Text("cowsay привет") },
+                    supportingText = { Text("пакет[@версия] [аргументы] — например: cowsay Привет! · semver -h · happy-birthday@1") },
+                )
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    "Установленные пакеты хранятся в песочнице (packages/) и переиспользуются.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        } else {
+            OutlinedTextField(
+                value = text,
+                onValueChange = { text = it },
+                modifier = Modifier.fillMaxWidth().weight(1.2f),
+                textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+                placeholder = {
+                    Text(
+                        if (mode == RuntimeKind.NODE) "console.log('Привет!')" else "print('Привет!')",
+                    )
+                },
+            )
+        }
         Spacer(Modifier.height(8.dp))
 
         Row(verticalAlignment = Alignment.CenterVertically) {
             Button(
-                onClick = { viewModel.runScript(text) },
+                onClick = {
+                    if (mode == RuntimeKind.NPX) viewModel.runNpxCommand(npxText) else viewModel.runScript(text)
+                },
                 enabled = runState !is AppViewModel.RunState.Running,
             ) {
                 Icon(Icons.Filled.PlayArrow, contentDescription = null)
                 Spacer(Modifier.width(4.dp))
-                Text("Запустить")
+                Text(if (mode == RuntimeKind.NPX) "Запустить" else "Сохранить и запустить")
             }
             Spacer(Modifier.width(8.dp))
             OutlinedButton(
@@ -130,13 +188,6 @@ fun EditorScreen(viewModel: AppViewModel) {
             if (output.isNotEmpty()) {
                 TextButton(onClick = viewModel::clearOutput) { Text("Очистить") }
             }
-        }
-        if (runState is AppViewModel.RunState.Running) {
-            Text(
-                "Chaquopy не может прервать скрипт — «Стоп» пометит запуск отменённым (код 130 после возврата).",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
         }
         Spacer(Modifier.height(8.dp))
 

@@ -154,6 +154,27 @@ object PythonRuntime {
         return Handle(running, cancelled)
     }
 
+    /**
+     * Runs [request] to completion (waiting for the worker) and returns the
+     * result. On timeout the run is flagged cancelled and a 124 result is
+     * returned. Used by the agent's run_python tool.
+     */
+    fun executeSync(request: ExecRequest, timeoutMs: Long): ExecResult {
+        val done = java.util.concurrent.CompletableFuture<ExecResult>()
+        val handle = execute(request, object : OutputListener {
+            override fun onFinished(result: ExecResult) { done.complete(result) }
+            override fun onFailed(error: Throwable) { done.completeExceptionally(error) }
+        })
+        return try {
+            done.get(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
+        } catch (e: java.util.concurrent.TimeoutException) {
+            handle.cancel()
+            ExecResult(124, "", "превышено время выполнения (${timeoutMs / 1000} с)", timeoutMs)
+        } catch (e: java.util.concurrent.ExecutionException) {
+            ExecResult(1, "", e.cause?.message ?: e.message ?: "ошибка запуска", 0)
+        }
+    }
+
     /** Forwards tailer output and keeps a capped copy for the final ExecResult. */
     private class CaptureListener(
         private val downstream: OutputListener,

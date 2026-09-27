@@ -174,39 +174,55 @@ tools/keygen/                         отдельный JVM-проект: genke
   флаг, и по возвращению выдаётся код 130. Убийство процесса невозможно —
   это честно показано в UI.
 
-### 4.2 Node-совместимый слой
+### 4.2 Node-совместимый слой ✅ готово (v1.2.0)
 
-* `runtime/js/NodeFs.kt` — примитивы для JS: `readFile`, `writeFile`, `exists`,
-  `readdir`, `stat`, `mkdir`, `unlink`, `rename`, всё через `Workspace.resolve`;
-* `runtime/js/JsRuntime.kt` — Rhino `Context` в ES6-режиме, безопасные
-  `initSafeStandardObjects`, лимит стека, `require`;
-* `assets/node/boot.js` — `path`, `process` (`argv`, `env`, `platform`, `cwd`,
-  `exit`), `console`, `os`, `util`, `Buffer` (на чистых JS-массивах, без
-  зависимости от `Uint8Array`), `url`;
-* резолв `node_modules`: вверх по `node_modules`, затем встроенные модули,
-  затем явный путь;
-* ограничение: нет нативных аддонов и worker_threads — только чистый JS.
+* `runtime/js/JsRuntime.kt` — Rhino 1.8.1 `Context` (`VERSION_ES6`,
+  `setOptimizationLevel(-1)`, `initSafeStandardObjects`), мост `__pr` на
+  BaseFunction-подклассах (Kotlin null → JS null, не undefined!), event loop
+  по хукам `__prRunDue/__prPending/__prNextDue/__prExitCode/__prOnExit`,
+  вывод через log-файлы и OutputTailer как у Python, отмена → код 130;
+* `assets/node/boot.js` — `require` (relative/json/`node_modules`/`packages/`,
+  `__dirname`, `__setMainDir` для главного скрипта), `module.exports`,
+  `path`, `process`, `console`, `os`, `util`, `events`, `url`/`querystring`,
+  `http(s)` (синхронный через мост, фейк-асинхронный API), `assert`, `stream`,
+  таймеры, `Buffer` (utf8/base64/hex, кириллица), полифилл `Promise`;
+  шебанг и `async function` срезаются при загрузке модулей;
+* песочница fs целиком на стороне моста (`Workspace.resolve`), выход за
+  корень = ENOENT/EACCES;
+* проверено: десктоп-харнесс (78 кейсов) + JVM-тесты `JsRuntimeTest` в CI;
+* ограничение: нет class/async-await/import-export/spread-литералов —
+  Rhino их не парсит; чистые ES5/ES6-пакеты работают.
 
-### 4.3 npx
+### 4.3 npx ✅ готово (v1.2.0)
 
-* `runtime/npm/TarReader.kt` — распаковка `.tar.gz` на `GZIPInputStream` +
-  свой Tar-ридер (ustar), с защитой от выхода за пределы каталога;
-* `runtime/npm/NpmRegistry.kt` — `https://registry.npmjs.org/<name>`, выбор
-  версии через `dist-tags.latest` или явную версию, скачивание `dist.tarball`;
-* `runtime/npm/NpxRuntime.kt` — разбор спецификатора (`pkg`, `pkg@1.2.3`,
-  `@scope/pkg`, локальный путь), установка в `packages/`, чтение поля `bin` из
-  `package.json`, запуск с `process.argv[1] = <bin>`.
+* `runtime/npm/Semver.kt` — semver-парсер и диапазоны (`^`, `~`, `>= <`,
+  `x`-диапазоны, `||`, prerelease-правила);
+* `runtime/npm/TarReader.kt` — распаковка `.tgz` (ustar + prefix-поле),
+  защита от выхода за пределы каталога;
+* `runtime/npm/NpmRegistry.kt` — метаданные и tarball'ы с
+  `registry.npmjs.org` (URLEncode для scoped, UA обязателен);
+* `runtime/npm/NpxRuntime.kt` — спецификаторы (`pkg`, `pkg@1.2.3`, `@scope/pkg@v`),
+  установка в `packages/<name>` с рекурсивными зависимостями (hoist, при
+  конфликте версий — вложенно в `packages/<parent>/node_modules/`), выбор
+  версии (exact/range/dist-tag/max satisfying), чтение `bin`, запуск через
+  JsRuntime с cwd вызывающего; кэш-first как у настоящего npx;
+* проверено вживую: `cowsay@1.4.0` (11 пакетов, кириллица, повторный запуск из
+  кэша), `semver@6.3.1` (валидация и диапазоны);
+* ограничение: пакеты с class/async/import или нативными аддонами не работают —
+  при parse-ошибке печатается подсказка попробовать старую версию.
 
-### 4.4 Агент (переписанный opencode)
+### 4.4 Агент ✅ готово (v1.2.0)
 
-* `agent/LlmClient.kt` — OpenAI-совместимый `/chat/completions` со стримингом
-  и поддержкой Anthropic-стиля tool calls;
-* `agent/Tools.kt` — `read_file`, `write_file`, `list_dir`, `run_python`,
-  `run_node`, `run_npx`, `search`;
-* `agent/Agent.kt` — цикл: сообщение → tool calls → результаты → повтор,
-  с лимитом на итерации;
-* доступен только для планов `pro`/`team`/`lifetime` — проверка в
-  `LicenseManager.LicenseState.Active.canUseAgent`.
+* `agent/AgentSettings.kt` — SharedPreferences: base URL / API-ключ / модель
+  (любой OpenAI-совместимый endpoint);
+* `agent/LlmClient.kt` — `/chat/completions` без стриминга, tool calls в
+  OpenAI-формате;
+* `agent/AgentTools.kt` — `list_projects`, `list_dir`, `read_file`,
+  `write_file`, `search_files`, `run_python`, `run_node`, `run_npx`
+  (executeSync с таймаутами 60/60/180 с);
+* `agent/Agent.kt` — цикл ≤10 шагов: сообщение → tool calls → результаты →
+  повтор до текстового ответа; история между ходами, отмена между шагами;
+* доступен только для планов с `canUseAgent` (pro) — гейт в UI и в ViewModel.
 
 ### 4.5 Интерфейс
 

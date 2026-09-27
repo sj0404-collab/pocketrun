@@ -137,6 +137,13 @@ android {
     }
 }
 
+// The JVM file layer encodes paths with sun.jnu.encoding, which is ASCII on a
+// C-locale runner; boot.js tests write files with Cyrillic names.
+tasks.withType<Test>().configureEach {
+    environment("LANG", "C.UTF-8")
+    environment("LC_ALL", "C.UTF-8")
+}
+
 /**
  * The Python version is selected HERE, not via a Maven dependency: in Chaquopy
  * 17 a `com.chaquo.python:python` dependency is silently ignored for version
@@ -175,10 +182,13 @@ dependencies {
     implementation("androidx.navigation:navigation-compose:2.8.4")
     implementation("androidx.documentfile:documentfile:1.0.1")
 
-    implementation("org.mozilla:rhino:1.7.14")
+    implementation("org.mozilla:rhino:1.8.1")
     implementation("net.i2p.crypto:eddsa:0.3.0")
 
     testImplementation("junit:junit:4.13.2")
+
+    // Real org.json on the JVM: the android.jar stub throws "not mocked" in unit tests.
+    testImplementation("org.json:json:20240303")
 
     debugImplementation("androidx.compose.ui:ui-tooling")
 }

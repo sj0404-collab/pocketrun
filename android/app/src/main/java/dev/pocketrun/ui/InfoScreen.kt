@@ -42,6 +42,8 @@ fun InfoScreen(viewModel: AppViewModel, license: LicenseManager.LicenseState.Act
 
         SectionCard("Рантайм") {
             InfoRow("CPython", viewModel.runtimeVersion() ?: "запускается…")
+            InfoRow("JavaScript", dev.pocketrun.runtime.js.JsRuntime.VERSION)
+            InfoRow("npm-пакеты", "${viewModel.npxRuntime.installedPackages().size} установлено")
             InfoRow("Статус", if (viewModel.runtimeAvailable()) "готов" else "инициализация")
         }
 
@@ -49,6 +51,19 @@ fun InfoScreen(viewModel: AppViewModel, license: LicenseManager.LicenseState.Act
             InfoRow("Версия", BuildConfig.VERSION_NAME ?: "-")
             InfoRow("versionCode", BuildConfig.VERSION_CODE.toString())
             InfoRow("Python ABI", "arm64-v8a, x86_64")
+        }
+
+        SectionCard("Агент") {
+            Text(
+                "Встроенный ассистент в стиле opencode: работает через любую " +
+                    "OpenAI-совместимую модель (OpenAI, OpenRouter, Groq, локальный llama.cpp), " +
+                    "выполняет инструменты в песочнице — файлы, Python, Node, npx.\n\n" +
+                    "Сам пакет opencode-ai запустить в песочнице нельзя: у него тяжёлые нативные " +
+                    "зависимости. Агент PocketRun даёт тот же сценарий работы — чат с запуском кода — " +
+                    "внутри приложения.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
         }
 
         Spacer(Modifier.height(4.dp))
