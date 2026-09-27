@@ -24,6 +24,9 @@ class PipeStream:
         self._file = open(path, "a", encoding="utf-8", buffering=1, errors="replace")
         self._mirror = mirror
 
+    encoding = "utf-8"
+    errors = "replace"
+
     def write(self, text):
         if not isinstance(text, str):
             text = str(text)
@@ -64,8 +67,25 @@ def run(script, args_json, stdin_text, out_path, err_path, cwd):
         _write_line(err_path, "python: no such file: %s" % script)
         return 2
 
-    args = json.loads(args_json) if args_json else []
-    previous = (sys.stdout, sys.stderr, sys.argv)
+    try:
+        args = json.loads(args_json) if args_json else []
+    except ValueError as exc:
+        _write_line(err_path, "python: invalid args json: %s" % exc)
+        return 2
+    if not isinstance(args, list):
+        _write_line(err_path, "python: args json must be a list")
+        return 2
+    args = [str(arg) for arg in args]
+
+    # The interpreter is process-wide, so every bit of global state we touch has
+    # to go back to exactly what it was, or the next run inherits it.
+    previous = (
+        sys.stdout,
+        sys.stderr,
+        sys.stdin,
+        sys.argv,
+        os.getcwd(),
+    )
     if cwd:
         try:
             os.chdir(cwd)
@@ -73,7 +93,7 @@ def run(script, args_json, stdin_text, out_path, err_path, cwd):
             _write_line(err_path, "python: cannot enter %s: %s" % (cwd, exc))
             return 2
 
-    sys.argv = [script] + list(args)
+    sys.argv = [script] + args
     script_dir = os.path.dirname(os.path.abspath(script))
     if script_dir not in sys.path:
         sys.path.insert(0, script_dir)
@@ -96,9 +116,13 @@ def run(script, args_json, stdin_text, out_path, err_path, cwd):
         traceback.print_exc(file=err)
         code = 1
     finally:
-        sys.stdout, sys.stderr, sys.argv = previous
+        sys.stdout, sys.stderr, sys.stdin, sys.argv = previous[:4]
         out.close()
         err.close()
+        try:
+            os.chdir(previous[4])
+        except OSError:
+            pass
     return code
 
 
@@ -165,4 +189,12 @@ def _write_line_to_stderr(text, path=None):
         with open(path, "a", encoding="utf-8") as handle:
             handle.write(text + "\n")
     else:
-        sys.__stderr__.write(text + "\n")
+        # sys.__stderr__ is None on builds where stderr is not connected.
+        stream = sys.__stderr__
+        if stream is None:
+            return
+        try:
+            stream.write(text + "\n")
+            stream.flush()
+        except Exception:
+            pass

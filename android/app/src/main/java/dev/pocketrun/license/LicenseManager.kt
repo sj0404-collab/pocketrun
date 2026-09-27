@@ -86,7 +86,10 @@ class LicenseManager(
             )
 
             is LicenseVerifier.Outcome.Expired ->
-                LicenseState.Rejected("This license expired on ${outcome.claims.expiresAt}.")
+                LicenseState.Rejected(
+                    "This license expired on " +
+                        java.time.Instant.ofEpochSecond(outcome.claims.expiresAt) + ".",
+                )
 
             is LicenseVerifier.Outcome.NotYetValid ->
                 LicenseState.Rejected("This license is not valid yet.")

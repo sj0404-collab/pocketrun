@@ -15,7 +15,8 @@ import java.util.Base64
  * If either side drifts, one of the two builds fails.
  */
 object Vector {
-    const val SEED = "MC4CAQAwBQYDK2VwBCIEIAsSGSAnLjU8Q0pRWF9mbXR7gomQl56lrLO6wcjP1t3k"
+    /** ByteArray(32) { (it * 7 + 11).toByte() }; fixed so the vector is reproducible. */
+    val SEED: ByteArray = ByteArray(32) { (it * 7 + 11).toByte() }
     const val PUBLIC_KEY = "14W0lYPuc2xmz1Xch0dPTzN8lxv8PWnLoeIeZ3Y2U68"
     const val PAYLOAD_SHA256 = "Kp-KE-mFSu3_E8uWyTPGuv8yNWimNLw2gP_qKVUBAY0"
     const val LICENSE_KEY =

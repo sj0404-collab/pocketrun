@@ -3,6 +3,7 @@ name: Android
 on:
   push:
     branches: ["**"]
+    tags: ["v*"]
   pull_request:
   workflow_dispatch:
 
@@ -20,6 +21,9 @@ jobs:
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
+          # The build derives versionCode/versionName from the nearest tag; the
+          # default checkout of a ref does not fetch tags even at depth 0.
+          fetch-tags: true
 
       - uses: actions/setup-java@v5
         with:
@@ -46,12 +50,14 @@ jobs:
         run: ./gradlew --no-daemon :app:assembleDebug
 
       - name: Assemble release APK
-        working-directory: android
         env:
           KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
           KEYSTORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           KEY_PASS: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        # No working-directory here on purpose: this step works from the repo
+        # root so the keystore lands in android/ (the Gradle rootProject) and
+        # gradlew is invoked from android/.
         run: |
           set -euo pipefail
           if [ -z "${KEYSTORE_B64:-}" ]; then
