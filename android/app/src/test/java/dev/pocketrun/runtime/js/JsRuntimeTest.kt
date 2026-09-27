@@ -1,6 +1,5 @@
 package dev.pocketrun.runtime.js
 
-import com.sun.net.httpserver.HttpServer
 import dev.pocketrun.core.Workspace
 import dev.pocketrun.runtime.ExecRequest
 import dev.pocketrun.runtime.RuntimeKind
@@ -9,8 +8,12 @@ import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
+import java.io.BufferedInputStream
 import java.io.File
-import java.net.InetSocketAddress
+import java.io.InputStream
+import java.net.InetAddress
+import java.net.ServerSocket
+import java.net.Socket
 
 /**
  * Integration tests for the Node layer: boot.js + JsRuntime + the workspace
@@ -185,23 +188,93 @@ class JsRuntimeTest {
 
     // ---------------------------------------------------------------- http
 
+    /**
+     * Two-endpoint HTTP server on a raw ServerSocket: com.sun.net.httpserver
+     * is a JDK class and Android unit tests compile against android.jar.
+     * GET /hello → "hi <method> <path>" (200); POST /echo → "echo:<body>" (201).
+     */
+    private class MiniHttp {
+        private val server = ServerSocket(0, 8, InetAddress.getByName("127.0.0.1"))
+        private val threads = mutableListOf<Thread>()
+        private val acceptor = Thread { acceptLoop() }
+
+        fun start() { acceptor.isDaemon = true; acceptor.start() }
+        fun stop() { runCatching { server.close() } }
+        val port: Int get() = server.localPort
+
+        private fun acceptLoop() {
+            while (true) {
+                val client = try { server.accept() } catch (e: Exception) { break }
+                val t = Thread { handle(client) }
+                t.isDaemon = true
+                threads += t
+                t.start()
+            }
+        }
+
+        private fun handle(client: Socket) {
+            client.use { socket ->
+                socket.soTimeout = 10_000
+                val input = BufferedInputStream(socket.getInputStream())
+                val requestLine = readLine(input) ?: return
+                val parts = requestLine.split(" ")
+                if (parts.size < 2) return
+                val method = parts[0]
+                val path = parts[1].substringBefore('?')
+                var contentLength = 0
+                while (true) {
+                    val line = readLine(input) ?: break
+                    if (line.isEmpty()) break
+                    val idx = line.indexOf(':')
+                    if (idx > 0 && line.substring(0, idx).equals("Content-Length", ignoreCase = true)) {
+                        contentLength = line.substring(idx + 1).trim().toIntOrNull() ?: 0
+                    }
+                }
+                val body = if (contentLength > 0) ByteArray(contentLength).also { readFully(input, it) }.toString(Charsets.UTF_8) else ""
+
+                val (status, reason, respBody) = when (path) {
+                    "/hello" -> Triple(200, "OK", "hi $method $path")
+                    "/echo" -> Triple(201, "Created", "echo:$body")
+                    else -> Triple(404, "Not Found", "nope")
+                }
+                val bytes = respBody.toByteArray(Charsets.UTF_8)
+                val head = "HTTP/1.1 $status $reason\r\nContent-Type: text/plain; charset=utf-8\r\n" +
+                    "Content-Length: ${bytes.size}\r\nConnection: close\r\n\r\n"
+                socket.getOutputStream().apply {
+                    write(head.toByteArray(Charsets.ISO_8859_1))
+                    write(bytes)
+                    flush()
+                }
+            }
+        }
+
+        private fun readLine(input: InputStream): String? {
+            val sb = StringBuilder()
+            while (true) {
+                val c = input.read()
+                if (c < 0) return if (sb.isEmpty()) null else sb.toString()
+                if (c == '\n'.code) return sb.toString().trimEnd('\r')
+                sb.append(c.toChar())
+                if (sb.length > 16_384) return sb.toString()
+            }
+        }
+
+        private fun readFully(input: InputStream, target: ByteArray) {
+            var done = 0
+            while (done < target.size) {
+                val n = input.read(target, done, target.size - done)
+                if (n < 0) return
+                done += n
+            }
+        }
+    }
+
     @Test
     fun httpGetAndPostAgainstLocalServer() {
-        val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
-        server.createContext("/hello") { exchange ->
-            val body = "hi ${exchange.requestMethod} ${exchange.requestURI}"
-            exchange.sendResponseHeaders(200, body.toByteArray(Charsets.UTF_8).size.toLong())
-            exchange.responseBody.use { it.write(body.toByteArray(Charsets.UTF_8)) }
-        }
-        server.createContext("/echo") { exchange ->
-            val text = exchange.requestBody.readBytes().toString(Charsets.UTF_8)
-            val body = "echo:$text"
-            exchange.sendResponseHeaders(201, body.toByteArray(Charsets.UTF_8).size.toLong())
-            exchange.responseBody.use { it.write(body.toByteArray(Charsets.UTF_8)) }
-        }
+        val server = MiniHttp()
         server.start()
         try {
-            val port = server.address.port
+            val port = server.port
             val workspace = Workspace.at(tmp.newFolder())
             val result = run(
                 workspace,
@@ -227,11 +300,11 @@ class JsRuntimeTest {
                 });
                 """.trimIndent(),
             )
-            assertEquals(0, result.exitCode)
+            assertEquals("stderr: ${result.stderr}", 0, result.exitCode)
             assertTrue("stdout: ${result.stdout}", result.stdout.contains("status=200 body=hi GET /hello"))
             assertTrue("stdout: ${result.stdout}", result.stdout.contains("post=201 echo:привет-POST"))
         } finally {
-            server.stop(0)
+            server.stop()
         }
     }
 
