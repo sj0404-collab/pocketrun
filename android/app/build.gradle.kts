@@ -138,6 +138,18 @@ android {
 }
 
 /**
+ * The Python version is selected HERE, not via a Maven dependency: in Chaquopy
+ * 17 a `com.chaquo.python:python` dependency is silently ignored for version
+ * selection and the build falls back to the default (3.10). 3.13 or later is
+ * also what supports devices with 16 KB memory pages.
+ */
+chaquopy {
+    defaultConfig {
+        version = "3.13"
+    }
+}
+
+/**
  * The Ed25519 public key that license signatures are checked against. Baked into the APK,
  * so rotating it is a build change: put the key in android/license.pubkey (or override with
  * -PlicensePubkey=...) and rebuild.
@@ -162,8 +174,6 @@ dependencies {
     implementation("androidx.compose.material:material-icons-extended")
     implementation("androidx.navigation:navigation-compose:2.8.4")
     implementation("androidx.documentfile:documentfile:1.0.1")
-
-    implementation("com.chaquo.python:python:3.13.15")
 
     implementation("org.mozilla:rhino:1.7.14")
     implementation("net.i2p.crypto:eddsa:0.3.0")
