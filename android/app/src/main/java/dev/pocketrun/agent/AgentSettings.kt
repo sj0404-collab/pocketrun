@@ -6,6 +6,9 @@ import android.content.Context
  * Agent configuration, stored in SharedPreferences. Works with any
  * OpenAI-compatible `/chat/completions` endpoint: OpenAI, OpenRouter, Groq,
  * Together, a local llama.cpp/vLLM server on the Wi-Fi network, …
+ *
+ * Also carries the agent-behaviour knobs (permission mode, max rounds) and
+ * the optional GitHub token used by the `github` tool.
  */
 object AgentSettings {
 
@@ -15,6 +18,20 @@ object AgentSettings {
     /** opencode Zen: the curated OpenAI-compatible gateway from opencode.ai/auth. */
     const val ZEN_BASE_URL = "https://opencode.ai/zen/v1"
     const val ZEN_AUTH_URL = "https://opencode.ai/auth"
+
+    /** Where the user creates a GitHub PAT (scopes: repo, workflow). */
+    const val GITHUB_TOKEN_URL = "https://github.com/settings/tokens/new?scopes=repo,workflow&description=PocketRun"
+    const val GITHUB_API = "https://api.github.com"
+
+    /** Permission modes for tool execution. */
+    const val MODE_AUTO = "auto"     // everything runs without asking
+    const val MODE_MANUAL = "manual" // mutations need a tap; reads run freely
+    const val MODE_ASK = "ask"       // the agent asks clarifying questions first
+    val MODES = listOf(MODE_AUTO, MODE_MANUAL, MODE_ASK)
+    val MODE_LABELS = mapOf(MODE_AUTO to "Авто", MODE_MANUAL to "Вручную", MODE_ASK to "Вопросы")
+
+    const val DEFAULT_MAX_STEPS = 12
+    const val MAX_STEPS_LIMIT = 60
 
     /** Ready-made presets shown in the model settings dialog. */
     data class Preset(val label: String, val baseUrl: String, val model: String)
@@ -30,6 +47,9 @@ object AgentSettings {
         val baseUrl: String = DEFAULT_BASE_URL,
         val apiKey: String = "",
         val model: String = DEFAULT_MODEL,
+        val githubToken: String = "",
+        val confirmMode: String = MODE_AUTO,
+        val maxSteps: Int = DEFAULT_MAX_STEPS,
     ) {
         /**
          * The API key is optional: local servers (llama.cpp, vLLM) need none,
@@ -39,6 +59,8 @@ object AgentSettings {
         val isReady: Boolean get() = baseUrl.isNotBlank() && model.isNotBlank()
         val endpoint: String get() = baseUrl.trimEnd('/') + "/chat/completions"
         val isZen: Boolean get() = baseUrl.contains("opencode.ai/zen")
+        val hasGitHub: Boolean get() = githubToken.isNotBlank()
+        val safeMaxSteps: Int get() = maxSteps.coerceIn(1, MAX_STEPS_LIMIT)
     }
 
     private const val PREFS = "agent"
@@ -49,6 +71,9 @@ object AgentSettings {
             baseUrl = prefs.getString("baseUrl", DEFAULT_BASE_URL)!!.trim().trimEnd('/').ifBlank { DEFAULT_BASE_URL },
             apiKey = prefs.getString("apiKey", "")!!.trim(),
             model = prefs.getString("model", DEFAULT_MODEL)!!.trim().ifBlank { DEFAULT_MODEL },
+            githubToken = prefs.getString("githubToken", "")!!.trim(),
+            confirmMode = prefs.getString("confirmMode", MODE_AUTO)!!.trim().let { if (it in MODES) it else MODE_AUTO },
+            maxSteps = prefs.getString("maxSteps", DEFAULT_MAX_STEPS.toString())!!.trim().toIntOrNull() ?: DEFAULT_MAX_STEPS,
         )
     }
 
@@ -58,6 +83,9 @@ object AgentSettings {
             .putString("baseUrl", config.baseUrl.trim().trimEnd('/'))
             .putString("apiKey", config.apiKey.trim())
             .putString("model", config.model.trim())
+            .putString("githubToken", config.githubToken.trim())
+            .putString("confirmMode", config.confirmMode)
+            .putString("maxSteps", config.safeMaxSteps.toString())
             .apply()
     }
 }

@@ -36,6 +36,30 @@ class AgentSettingsTest {
     }
 
     @Test
+    fun behaviourKnobsRoundTrip() {
+        // confirm modes and round limits with sane defaults and clamping
+        val auto = AgentSettings.Config()
+        assertEquals(AgentSettings.MODE_AUTO, auto.confirmMode)
+        assertEquals(AgentSettings.DEFAULT_MAX_STEPS, auto.safeMaxSteps)
+        assertFalse(auto.hasGitHub)
+
+        val tuned = AgentSettings.Config(
+            baseUrl = AgentSettings.ZEN_BASE_URL,
+            model = "big-pickle",
+            githubToken = "ghp_test",
+            confirmMode = AgentSettings.MODE_MANUAL,
+            maxSteps = 999,
+        )
+        assertTrue(tuned.hasGitHub)
+        assertEquals(AgentSettings.MODE_MANUAL, tuned.confirmMode)
+        assertEquals(AgentSettings.MAX_STEPS_LIMIT, tuned.safeMaxSteps)
+
+        val asker = tuned.copy(confirmMode = AgentSettings.MODE_ASK, maxSteps = 0)
+        assertEquals(AgentSettings.MODE_ASK, asker.confirmMode)
+        assertEquals(1, asker.safeMaxSteps)
+    }
+
+    @Test
     fun modelsListParsingShape() {
         // GET /models of Zen returns OpenAI-style {"data":[{"id":...}]}
         val payload = JSONObject().put(

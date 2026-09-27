@@ -1,6 +1,10 @@
 package dev.pocketrun.ui
 
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -21,17 +25,20 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.AttachFile
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilterChip
@@ -51,15 +58,24 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import dev.pocketrun.agent.AgentSettings
+import dev.pocketrun.agent.opencode.Sessions
+import kotlinx.coroutines.delay
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 /**
- * The opencode-style agent chat: sessions with resume/fork/export, a todo
- * panel, interactive question cards and the model settings (with the OpenCode
- * Zen preset and a live model catalog).
+ * The opencode-style agent chat: tabs with independent sessions, a todo panel,
+ * interactive question/approval cards, attachments, live round/time counters,
+ * retry, copy-to-clipboard and the model settings (Zen preset, live model
+ * catalog, GitHub token, permission mode, round limit).
  */
 @Composable
 fun AgentScreen(viewModel: AppViewModel) {
@@ -69,14 +85,35 @@ fun AgentScreen(viewModel: AppViewModel) {
     val session by viewModel.currentSession.collectAsState()
     val todos by viewModel.todos.collectAsState()
     val pendingQuestion by viewModel.pendingQuestion.collectAsState()
+    val pendingApproval by viewModel.pendingApproval.collectAsState()
+    val tabs by viewModel.openTabs.collectAsState()
+    val steps by viewModel.agentSteps.collectAsState()
+    val turnStartedAt by viewModel.turnStartedAt.collectAsState()
 
     var input by remember { mutableStateOf("") }
     var showSettings by remember { mutableStateOf(false) }
     var showSessions by remember { mutableStateOf(false) }
 
+    // Live "m:ss" ticker while the agent works.
+    var elapsed by remember { mutableStateOf(0L) }
+    LaunchedEffect(running, turnStartedAt) {
+        if (running) {
+            while (true) {
+                elapsed = (System.currentTimeMillis() - turnStartedAt) / 1000
+                delay(1000)
+            }
+        }
+    }
+
     val listState = rememberLazyListState()
     LaunchedEffect(messages.size) {
         if (messages.isNotEmpty()) listState.animateScrollToItem(messages.size - 1)
+    }
+
+    // File attachment: any file → copied into the project and sent to the agent.
+    val context = LocalContext.current
+    val filePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) viewModel.attachFile(uri)
     }
 
     Column(Modifier.fillMaxSize().imePadding()) {
@@ -90,7 +127,12 @@ fun AgentScreen(viewModel: AppViewModel) {
                     text = when {
                         !viewModel.canUseAgent() -> "требуется план Pro"
                         !config.isReady -> "модель не настроена"
-                        else -> (session?.title?.takeIf { it != "Новая сессия" }?.let { "$it · " } ?: "") + config.model
+                        else -> buildString {
+                            append(config.model)
+                            append(" · ")
+                            append(AgentSettings.MODE_LABELS[config.confirmMode] ?: config.confirmMode)
+                            if (config.hasGitHub) append(" · GitHub")
+                        }
                     },
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -104,7 +146,46 @@ fun AgentScreen(viewModel: AppViewModel) {
                 Icon(Icons.Filled.History, contentDescription = "Сессии")
             }
             IconButton(onClick = { showSettings = true }) {
-                Icon(Icons.Filled.Settings, contentDescription = "Настройки модели")
+                Icon(Icons.Filled.Settings, contentDescription = "Настройки")
+            }
+        }
+
+        // ---------------------------------------------------------------- tabs
+        if (tabs.isNotEmpty()) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 12.dp),
+            ) {
+                tabs.forEach { tab ->
+                    val selected = tab.id == session?.id
+                    FilterChip(
+                        selected = selected,
+                        onClick = { viewModel.switchTab(tab.id) },
+                        enabled = !running,
+                        label = {
+                            Text(
+                                (if (tab.parentID != null) "⑂ " else "") + tab.title.take(18),
+                                maxLines = 1,
+                                style = MaterialTheme.typography.labelMedium,
+                            )
+                        },
+                        modifier = Modifier.padding(end = 6.dp),
+                    )
+                }
+                IconButton(onClick = viewModel::newTab, enabled = !running) {
+                    Icon(Icons.Filled.Add, contentDescription = "Новая вкладка", modifier = Modifier.size(18.dp))
+                }
+                if (session != null) {
+                    IconButton(onClick = viewModel::closeCurrentTab, enabled = !running && tabs.size > 0) {
+                        Icon(Icons.Filled.Close, contentDescription = "Закрыть вкладку", modifier = Modifier.size(18.dp))
+                    }
+                }
+            }
+        } else if (!running) {
+            TextButton(onClick = viewModel::newTab) {
+                Icon(Icons.Filled.Add, contentDescription = null, modifier = Modifier.size(16.dp))
+                Spacer(Modifier.width(4.dp))
+                Text("Новая вкладка (своя сессия)")
             }
         }
 
@@ -133,13 +214,22 @@ fun AgentScreen(viewModel: AppViewModel) {
                         CircularProgressIndicator(Modifier.size(14.dp), strokeWidth = 2.dp)
                         Spacer(Modifier.width(8.dp))
                         Text(
-                            "агент работает…",
+                            "агент работает… · раунд $steps · %d:%02d".format(elapsed / 60, elapsed % 60),
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
                 }
             }
+            if (!running && messages.lastOrNull() is AppViewModel.AgentItem.Error) {
+                item {
+                    TextButton(onClick = viewModel::retryLast) { Text("↻ Повторить последний запрос") }
+                }
+            }
+        }
+
+        pendingApproval?.let { pa ->
+            ApprovalCard(pa)
         }
 
         pendingQuestion?.let { pq ->
@@ -150,18 +240,25 @@ fun AgentScreen(viewModel: AppViewModel) {
             verticalAlignment = Alignment.Bottom,
             modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
         ) {
+            IconButton(
+                onClick = { filePicker.launch(arrayOf("*/*")) },
+                enabled = !running,
+            ) {
+                Icon(Icons.Filled.AttachFile, contentDescription = "Отправить файл агенту")
+            }
+            Spacer(Modifier.width(4.dp))
             OutlinedTextField(
                 value = input,
                 onValueChange = { input = it },
                 modifier = Modifier.weight(1f),
-                placeholder = { Text("Спросите агента… /new — новая сессия, /init — создать AGENTS.md") },
+                placeholder = { Text("Спросите агента… /help — справка") },
                 maxLines = 4,
                 enabled = !running,
             )
             Spacer(Modifier.width(8.dp))
             if (running) {
                 Button(onClick = viewModel::cancelAgent) {
-                    Icon(Icons.Filled.Stop, contentDescription = null)
+                    Icon(Icons.Filled.Stop, contentDescription = "Остановить (сессия сохранится)")
                 }
             } else {
                 Button(
@@ -209,7 +306,7 @@ private fun AgentEmptyHint() {
         )
         Spacer(Modifier.height(12.dp))
         Text(
-            "Модель — любой OpenAI-совместимый API; пресет OpenCode Zen\nберёт ключ на opencode.ai/auth. /new — новая сессия, /init — AGENTS.md.",
+            "📎 — отправить файл · /help — все команды · ⚙ — модель, GitHub, режим подтверждений",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             textAlign = androidx.compose.ui.text.style.TextAlign.Center,
@@ -220,7 +317,7 @@ private fun AgentEmptyHint() {
 // ------------------------------------------------------------------- todos
 
 @Composable
-private fun TodoPanel(todos: List<dev.pocketrun.agent.opencode.Sessions.Todo>) {
+private fun TodoPanel(todos: List<Sessions.Todo>) {
     Surface(
         color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.4f),
         shape = RoundedCornerShape(12.dp),
@@ -253,6 +350,40 @@ private fun TodoPanel(todos: List<dev.pocketrun.agent.opencode.Sessions.Todo>) {
                         color = if (todo.isDone) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.onSurface,
                     )
                 }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------- approval
+
+@Composable
+private fun ApprovalCard(pa: AppViewModel.PendingApproval) {
+    Surface(
+        color = MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.6f),
+        shape = RoundedCornerShape(16.dp),
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
+    ) {
+        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Text(
+                "Разрешить инструмент «${pa.tool}»?",
+                style = MaterialTheme.typography.titleSmall,
+                color = MaterialTheme.colorScheme.onErrorContainer,
+            )
+            if (pa.argsPreview.isNotBlank()) {
+                Text(
+                    pa.argsPreview,
+                    style = MaterialTheme.typography.bodySmall,
+                    fontFamily = FontFamily.Monospace,
+                    fontSize = 11.sp,
+                    color = MaterialTheme.colorScheme.onErrorContainer,
+                    maxLines = 6,
+                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                )
+            }
+            Row(horizontalArrangement = Arrangement.End, modifier = Modifier.fillMaxWidth()) {
+                TextButton(onClick = { pa.respond(false) }) { Text("Отклонить") }
+                TextButton(onClick = { pa.respond(true) }) { Text("Разрешить") }
             }
         }
     }
@@ -334,7 +465,7 @@ private fun QuestionCard(pq: AppViewModel.PendingQuestion) {
 private fun SessionsDialog(viewModel: AppViewModel, onDismiss: () -> Unit) {
     val sessions by viewModel.sessionList.collectAsState()
     val current by viewModel.currentSession.collectAsState()
-    var renaming by remember { mutableStateOf<dev.pocketrun.agent.opencode.Sessions.SessionInfo?>(null) }
+    var renaming by remember { mutableStateOf<Sessions.SessionInfo?>(null) }
     var renameText by remember { mutableStateOf("") }
 
     AlertDialog(
@@ -342,7 +473,7 @@ private fun SessionsDialog(viewModel: AppViewModel, onDismiss: () -> Unit) {
         title = { Text("Сессии") },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                TextButton(onClick = { viewModel.newSession(); onDismiss() }) {
+                TextButton(onClick = { viewModel.newTab(); onDismiss() }) {
                     Icon(Icons.Filled.Add, contentDescription = null, modifier = Modifier.size(16.dp))
                     Spacer(Modifier.width(6.dp))
                     Text("Новая сессия (/new)")
@@ -368,13 +499,13 @@ private fun SessionsDialog(viewModel: AppViewModel, onDismiss: () -> Unit) {
                                     maxLines = 1,
                                 )
                                 Text(
-                                    "${s.project ?: "—"} · ${java.text.SimpleDateFormat("dd.MM HH:mm", java.util.Locale.getDefault()).format(java.util.Date(s.updatedAt))}" +
+                                    "${s.project ?: "—"} · ${SimpleDateFormat("dd.MM HH:mm", Locale.getDefault()).format(Date(s.updatedAt))}" +
                                         (s.parentID?.let { " · форк" } ?: ""),
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 )
                                 Row {
-                                    TextButton(onClick = { viewModel.openSession(s.id); onDismiss() }) { Text("Открыть") }
+                                    TextButton(onClick = { viewModel.switchTab(s.id); onDismiss() }) { Text("Открыть") }
                                     TextButton(onClick = { viewModel.forkSession(s.id) }) { Text("Форк") }
                                     TextButton(onClick = { renaming = s; renameText = s.title }) {
                                         Icon(Icons.Filled.Edit, contentDescription = "Переименовать", modifier = Modifier.size(14.dp))
@@ -417,66 +548,98 @@ private fun SessionsDialog(viewModel: AppViewModel, onDismiss: () -> Unit) {
 
 // ---------------------------------------------------------------- bubbles
 
+/** Long-press on any bubble copies its text. */
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun CopyableSurface(contentAlignment: Alignment, shape: RoundedCornerShape, color: androidx.compose.ui.graphics.Color, text: String, content: @Composable () -> Unit) {
+    val clipboard = LocalClipboardManager.current
+    val context = LocalContext.current
+    Box(Modifier.fillMaxWidth(), contentAlignment = contentAlignment) {
+        Surface(
+            color = color,
+            shape = shape,
+            modifier = Modifier
+                .widthIn(max = 340.dp)
+                .combinedClickable(
+                    onClick = {},
+                    onLongClick = {
+                        clipboard.setText(AnnotatedString(text))
+                        android.widget.Toast.makeText(context, "Скопировано", android.widget.Toast.LENGTH_SHORT).show()
+                    },
+                ),
+        ) {
+            content()
+        }
+    }
+}
+
 @Composable
 private fun AgentBubble(item: AppViewModel.AgentItem) {
     when (item) {
-        is AppViewModel.AgentItem.User -> BubbleRight(item.text)
-        is AppViewModel.AgentItem.Assistant -> BubbleLeft(item.text)
-        is AppViewModel.AgentItem.Error -> Text(
-            item.text,
-            color = MaterialTheme.colorScheme.error,
-            style = MaterialTheme.typography.bodySmall,
-            modifier = Modifier.padding(horizontal = 8.dp),
-        )
+        is AppViewModel.AgentItem.User -> CopyableSurface(
+            contentAlignment = Alignment.CenterEnd,
+            shape = RoundedCornerShape(16.dp, 4.dp, 16.dp, 16.dp),
+            color = MaterialTheme.colorScheme.primaryContainer,
+            text = item.text,
+        ) {
+            Text(item.text, modifier = Modifier.padding(12.dp), style = MaterialTheme.typography.bodyMedium)
+        }
+        is AppViewModel.AgentItem.Assistant -> CopyableSurface(
+            contentAlignment = Alignment.CenterStart,
+            shape = RoundedCornerShape(4.dp, 16.dp, 16.dp, 16.dp),
+            color = MaterialTheme.colorScheme.surfaceVariant,
+            text = item.text,
+        ) {
+            Text(
+                item.text,
+                modifier = Modifier.padding(12.dp),
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurface,
+            )
+        }
+        is AppViewModel.AgentItem.Error -> CopyableSurface(
+            contentAlignment = Alignment.CenterStart,
+            shape = RoundedCornerShape(8.dp),
+            color = MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.5f),
+            text = item.text,
+        ) {
+            Text(
+                item.text,
+                modifier = Modifier.padding(10.dp),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onErrorContainer,
+            )
+        }
         is AppViewModel.AgentItem.Info -> Text(
             item.text,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
             style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier.padding(horizontal = 8.dp),
         )
         is AppViewModel.AgentItem.Tool -> ToolRow(item)
     }
 }
 
-@Composable
-private fun BubbleRight(text: String) {
-    Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.CenterEnd) {
-        Surface(
-            color = MaterialTheme.colorScheme.primaryContainer,
-            shape = RoundedCornerShape(16.dp, 4.dp, 16.dp, 16.dp),
-            modifier = Modifier.widthIn(max = 320.dp),
-        ) {
-            Text(text, modifier = Modifier.padding(12.dp), style = MaterialTheme.typography.bodyMedium)
-        }
-    }
-}
-
-@Composable
-private fun BubbleLeft(text: String) {
-    Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.CenterStart) {
-        Surface(
-            color = MaterialTheme.colorScheme.surfaceVariant,
-            shape = RoundedCornerShape(4.dp, 16.dp, 16.dp, 16.dp),
-            modifier = Modifier.widthIn(max = 340.dp),
-        ) {
-            Text(
-                text,
-                modifier = Modifier.padding(12.dp),
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurface,
-            )
-        }
-    }
-}
-
+/** Long-press on a tool row copies the call and its result. */
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun ToolRow(item: AppViewModel.AgentItem.Tool) {
+    val clipboard = LocalClipboardManager.current
+    val context = LocalContext.current
     Surface(
         color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
         shape = RoundedCornerShape(10.dp),
         modifier = Modifier.fillMaxWidth(),
     ) {
-        Column(Modifier.padding(10.dp)) {
+        Column(
+            Modifier.padding(10.dp).combinedClickable(
+                onClick = {},
+                onLongClick = {
+                    clipboard.setText(AnnotatedString("🛠 ${item.name} ${item.args}\n${item.result ?: ""}"))
+                    android.widget.Toast.makeText(context, "Скопировано", android.widget.Toast.LENGTH_SHORT).show()
+                },
+            ),
+        ) {
             Text(
                 "🛠 ${item.name}${if (item.args.isNotBlank()) " · ${item.args.take(120)}" else ""}",
                 style = MaterialTheme.typography.bodySmall,
@@ -512,18 +675,24 @@ private fun LlmSettingsDialog(
     var baseUrl by remember { mutableStateOf(config.baseUrl) }
     var apiKey by remember { mutableStateOf(config.apiKey) }
     var model by remember { mutableStateOf(config.model) }
+    var githubToken by remember { mutableStateOf(config.githubToken) }
+    var confirmMode by remember { mutableStateOf(config.confirmMode) }
+    var maxSteps by remember { mutableStateOf(config.safeMaxSteps.toString()) }
     val catalog by viewModel.modelCatalog.collectAsState()
     val catalogState by viewModel.modelCatalogState.collectAsState()
+    val ctx = LocalContext.current
 
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Настройки модели") },
+        title = { Text("Настройки агента") },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                // Presets: one tap fills the fields; Zen is the opencode catalog.
-                FlowRow(
-                    horizontalArrangement = Arrangement.spacedBy(6.dp),
-                ) {
+            Column(
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+                modifier = Modifier.verticalScroll(rememberScrollState()),
+            ) {
+                // ---- model
+                Text("Модель", style = MaterialTheme.typography.titleSmall)
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                     AgentSettings.PRESETS.forEach { preset ->
                         FilterChip(
                             selected = baseUrl == preset.baseUrl,
@@ -558,10 +727,9 @@ private fun LlmSettingsDialog(
                     visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation(),
                 )
                 if (baseUrl.contains("opencode.ai/zen")) {
-                    val context = androidx.compose.ui.platform.LocalContext.current
                     TextButton(onClick = {
                         runCatching {
-                            context.startActivity(
+                            ctx.startActivity(
                                 android.content.Intent(
                                     android.content.Intent.ACTION_VIEW,
                                     android.net.Uri.parse("https://opencode.ai/auth"),
@@ -596,7 +764,7 @@ private fun LlmSettingsDialog(
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
-                    LazyColumn(modifier = Modifier.heightIn(max = 180.dp)) {
+                    LazyColumn(modifier = Modifier.heightIn(max = 160.dp)) {
                         items(catalog) { id ->
                             Text(
                                 id,
@@ -611,15 +779,76 @@ private fun LlmSettingsDialog(
                         }
                     }
                 }
+
+                // ---- behaviour
+                Text("Поведение", style = MaterialTheme.typography.titleSmall)
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    AgentSettings.MODES.forEach { mode ->
+                        FilterChip(
+                            selected = confirmMode == mode,
+                            onClick = { confirmMode = mode },
+                            label = { Text(AgentSettings.MODE_LABELS[mode] ?: mode) },
+                        )
+                    }
+                }
                 Text(
-                    "Ключ хранится только на устройстве и отправляется напрямую указанному серверу.",
+                    "Авто — инструменты выполняются сразу · Вручную — изменения (файлы, bash, GitHub) требуют подтверждения · Вопросы — агент сначала задаёт уточняющие вопросы",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                OutlinedTextField(
+                    value = maxSteps,
+                    onValueChange = { maxSteps = it.filter { c -> c.isDigit() }.take(2) },
+                    label = { Text("Раундов на ход (1–${AgentSettings.MAX_STEPS_LIMIT})") },
+                    supportingText = { Text("сколько tool-циклов может сделать агент за один запрос") },
+                    singleLine = true,
+                )
+
+                // ---- github
+                Text("GitHub", style = MaterialTheme.typography.titleSmall)
+                OutlinedTextField(
+                    value = githubToken,
+                    onValueChange = { githubToken = it },
+                    label = { Text("GitHub PAT (не обязателен)") },
+                    supportingText = { Text("даёт агенту инструмент github: репозитории, Actions-раннеры (npm, opencode), логи, артефакты") },
+                    singleLine = true,
+                    visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation(),
+                )
+                if (githubToken.isBlank()) {
+                    TextButton(onClick = {
+                        runCatching {
+                            ctx.startActivity(
+                                android.content.Intent(
+                                    android.content.Intent.ACTION_VIEW,
+                                    android.net.Uri.parse(AgentSettings.GITHUB_TOKEN_URL),
+                                ),
+                            )
+                        }
+                    }) { Text("Создать токен (repo + workflow) → github.com") }
+                }
+                Text(
+                    "Ключи хранятся только на устройстве: модель отправляется указанному LLM-серверу, GitHub-токен — только api.github.com.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
         },
         confirmButton = {
-            TextButton(onClick = { onSave(AgentSettings.Config(baseUrl, apiKey, model)) }) { Text("Сохранить") }
+            TextButton(
+                onClick = {
+                    val steps = maxSteps.toIntOrNull()?.coerceIn(1, AgentSettings.MAX_STEPS_LIMIT) ?: AgentSettings.DEFAULT_MAX_STEPS
+                    onSave(
+                        AgentSettings.Config(
+                            baseUrl = baseUrl,
+                            apiKey = apiKey,
+                            model = model,
+                            githubToken = githubToken,
+                            confirmMode = confirmMode,
+                            maxSteps = steps,
+                        ),
+                    )
+                },
+            ) { Text("Сохранить") }
         },
         dismissButton = {
             TextButton(onClick = onDismiss) { Text("Отмена") }

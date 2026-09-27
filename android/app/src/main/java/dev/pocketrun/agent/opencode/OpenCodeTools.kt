@@ -20,6 +20,7 @@ class OpenCodeTools(
     jsRuntime: JsRuntime,
     npxRuntime: NpxRuntime,
     private val projectDir: File?,
+    private val githubToken: String = "",
 ) {
 
     companion object {
@@ -35,6 +36,14 @@ class OpenCodeTools(
     /** Answers pending questions; set by the agent runner. */
     @Volatile
     var questionAsker: ((List<Question>) -> String)? = null
+
+    /**
+     * Manual confirmation gate: return false to refuse the tool call. Only
+     * invoked for mutating tools (writes, edits, bash, github mutations);
+     * reads always run. Set by the runner when the mode is "manual".
+     */
+    @Volatile
+    var toolApprover: ((name: String, argsJson: String) -> Boolean)? = null
 
     /** Todo updates flow to the session and UI through this hook. */
     @Volatile
@@ -195,12 +204,51 @@ class OpenCodeTools(
             ),
             listOf("questions"),
         )
+        tool(
+            "github",
+            "Work with GitHub through its REST API: repositories, files, and **GitHub Actions runners**. " +
+                "Runners (runs-on: ubuntu-latest) are full Linux machines — there you can run npm packages, " +
+                "opencode itself (npm i -g opencode-ai; opencode run \"…\"), compilers, tests — the heavy work " +
+                "the mobile sandbox cannot do. Typical flow: repo_create → push (code + .github/workflows/run.yml " +
+                "with `on: workflow_dispatch`) → dispatch → poll runs → logs → artifacts. " +
+                "Ops: me; repo_list; repo_create{name,private,description?}; push{repo,files[{path,content}],message,branch?}; " +
+                "file_get{repo,path,ref?}; workflow_create{repo,filename,yaml}; dispatch{repo,workflow,ref?}; " +
+                "runs{repo,limit?}; logs{repo,run_id}; artifacts{repo,run_id?}; artifact_download{repo,artifact_id}; " +
+                "api{method,path,body?} for anything else (PRs, issues, releases). " +
+                "Requires a GitHub token in the app settings (⚙ → GitHub, scopes repo+workflow).",
+            JSONObject()
+                .put("op", str("op", "operation name, see the list above"))
+                .put("repo", str("repo", "owner/name"))
+                .put("name", str("name", "repo name (for repo_create)"))
+                .put("private", bool("private", "create a private repo (repo_create)"))
+                .put("description", str("description", "repo description (repo_create)"))
+                .put("files", arr("files", "files to push", JSONObject().put("type", "object").put("properties", JSONObject().put("path", str("path", "")).put("content", str("content", ""))).put("required", JSONArray(listOf("path", "content")))))
+                .put("message", str("message", "commit message (push)"))
+                .put("branch", str("branch", "branch name (push/file_get)"))
+                .put("path", str("path", "file path (file_get)"))
+                .put("ref", str("ref", "git ref (file_get/dispatch)"))
+                .put("filename", str("filename", "workflow file name, e.g. run.yml (workflow_create)"))
+                .put("yaml", str("yaml", "workflow YAML content (workflow_create)"))
+                .put("workflow", str("workflow", "workflow file name (dispatch)"))
+                .put("run_id", JSONObject().put("type", "integer").put("description", "run id (logs/artifacts)"))
+                .put("artifact_id", JSONObject().put("type", "integer").put("description", "artifact id (artifact_download)"))
+                .put("limit", int("limit", "max runs to list"))
+                .put("method", str("method", "HTTP method (api)"))
+                .put("api_path", str("api_path", "REST path like /repos/o/n/pulls (api)"))
+                .put("body", str("body", "JSON body (api)")),
+            listOf("op"),
+        )
     }
 
     /** Executes one tool call; never throws — errors come back as text. */
     fun execute(name: String, argsJson: String): String {
         return try {
             val args = JSONObject(argsJson.ifBlank { "{}" })
+            // Manual confirmation gate: mutating tools ask the user first.
+            val approver = toolApprover
+            if (approver != null && !isReadOnly(name, args)) {
+                if (!approver(name, argsJson)) return "(отклонено пользователем)"
+            }
             when (name) {
                 "bash" -> doBash(args)
                 "read" -> doRead(args)
@@ -214,11 +262,19 @@ class OpenCodeTools(
                 "webfetch" -> doWebFetch(args)
                 "skill" -> doSkill(args)
                 "question" -> doQuestion(args)
+                "github" -> doGitHub(args)
                 else -> "unknown tool: $name"
             }
         } catch (t: Throwable) {
             "error: ${t.message ?: t.javaClass.simpleName}"
         }
+    }
+
+    /** True when the call cannot change anything (auto-approved in manual mode). */
+    fun isReadOnly(name: String, args: JSONObject): Boolean = when (name) {
+        "read", "list", "glob", "grep", "webfetch", "skill", "question", "todowrite" -> true
+        "github" -> args.optString("op") in GitHubClient.READ_OPS
+        else -> false
     }
 
     // ---------------------------------------------------------------- tools
@@ -397,6 +453,47 @@ class OpenCodeTools(
         if (questions.isEmpty()) return "error: нет вопросов"
         val asker = questionAsker ?: return "(вопросы недоступны в этом режиме)"
         return asker(questions)
+    }
+
+    private fun doGitHub(args: JSONObject): String {
+        if (githubToken.isBlank()) {
+            return "error: GitHub-токен не задан — откройте ⚙ → GitHub и вставьте PAT (scopes repo, workflow)"
+        }
+        val gh = GitHubClient(githubToken)
+        val op = args.optString("op")
+        return try {
+            when (op) {
+                "me" -> gh.me()
+                "repo_list" -> gh.repoList()
+                "repo_create" -> gh.repoCreate(
+                    name = args.getString("name"),
+                    private = args.optBoolean("private", true),
+                    description = args.optString("description").takeIf { it.isNotEmpty() },
+                )
+                "push" -> {
+                    val arr = args.optJSONArray("files") ?: return "error: нужен массив files[{path,content}]"
+                    val files = mutableListOf<Pair<String, String>>()
+                    for (i in 0 until arr.length()) {
+                        val f = arr.optJSONObject(i) ?: continue
+                        val p = f.optString("path")
+                        if (p.isNotEmpty()) files += p to f.optString("content")
+                    }
+                    if (files.isEmpty()) return "error: files пуст"
+                    gh.pushFiles(args.getString("repo"), files, args.optString("message", "update"), args.optString("branch").takeIf { it.isNotEmpty() })
+                }
+                "file_get" -> gh.fileGet(args.getString("repo"), args.getString("path"), args.optString("ref").takeIf { it.isNotEmpty() })
+                "workflow_create" -> gh.workflowCreate(args.getString("repo"), args.optString("filename", "run.yml"), args.getString("yaml"))
+                "dispatch" -> gh.dispatch(args.getString("repo"), args.getString("workflow"), args.optString("ref").takeIf { it.isNotEmpty() })
+                "runs" -> gh.runs(args.getString("repo"), args.optInt("limit", 10))
+                "logs" -> gh.logs(args.getString("repo"), args.getLong("run_id"))
+                "artifacts" -> gh.artifacts(args.getString("repo"), args.optLong("run_id", 0).takeIf { it != 0L })
+                "artifact_download" -> gh.artifactDownload(args.getString("repo"), args.getLong("artifact_id"))
+                "api" -> gh.api(args.optString("method", "GET"), args.getString("api_path"), args.optString("body").takeIf { it.isNotEmpty() })
+                else -> "error: неизвестная операция '$op' (me, repo_list, repo_create, push, file_get, workflow_create, dispatch, runs, logs, artifacts, artifact_download, api)"
+            }
+        } catch (e: GitHubClient.GitHubException) {
+            "error: ${e.message}"
+        }
     }
 
     // ---------------------------------------------------------------- helpers

@@ -151,6 +151,27 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private val _modelCatalogState = MutableStateFlow<String?>(null)
     val modelCatalogState: StateFlow<String?> = _modelCatalogState.asStateFlow()
 
+    /** Open tabs — each tab is its own agent session (browser-style). */
+    private val _openTabs = MutableStateFlow<List<Sessions.SessionInfo>>(emptyList())
+    val openTabs: StateFlow<List<Sessions.SessionInfo>> = _openTabs.asStateFlow()
+
+    /** A mutating tool call the agent is blocked on in manual confirm mode. */
+    data class PendingApproval(val tool: String, val argsPreview: String, val respond: (Boolean) -> Unit)
+
+    private val _pendingApproval = MutableStateFlow<PendingApproval?>(null)
+    val pendingApproval: StateFlow<PendingApproval?> = _pendingApproval.asStateFlow()
+
+    /** Live counters of the running turn: rounds done and when it started. */
+    private val _agentSteps = MutableStateFlow(0)
+    val agentSteps: StateFlow<Int> = _agentSteps.asStateFlow()
+
+    private val _turnStartedAt = MutableStateFlow(0L)
+    val turnStartedAt: StateFlow<Long> = _turnStartedAt.asStateFlow()
+
+    /** Last user prompt, for the retry button. */
+    @Volatile
+    private var lastPrompt: String? = null
+
     private val agentExecutor: ExecutorService =
         Executors.newSingleThreadExecutor { r -> Thread(r, "pocketrun-agent").apply { isDaemon = true } }
 
@@ -294,11 +315,45 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 )
                 return
             }
+            "/skills" -> {
+                val found = dev.pocketrun.agent.opencode.Skills(workspace).discover(_selected.value?.dir)
+                _agentMessages.update {
+                    it + AgentItem.Info(
+                        if (found.isEmpty()) "Навыков не найдено. Создайте свой: папка .opencode/skills/<имя>/SKILL.md в проекте с frontmatter name и description (или попросите агента — он умеет создавать навыки сам)."
+                        else "Навыки:\n" + found.joinToString("\n") { s -> "• ${s.name}${if (s.global) " (глобальный)" else ""} — ${s.description}" },
+                    )
+                }
+                return
+            }
+            "/help" -> {
+                _agentMessages.update {
+                    it + AgentItem.Info(
+                        "Команды: /new — новая сессия · /init — создать AGENTS.md · /skills — список навыков · /help — эта справка.\n\n" +
+                            "Навыки: создайте .opencode/skills/<имя>/SKILL.md (frontmatter: name, description) — агент подхватит и сможет загружать; глобальные — workspace/opencode/skills/.\n" +
+                            "Инструкции: AGENTS.md в проекте + глобальный opencode/AGENTS.md, фолбэк CLAUDE.md; список файлов/URL — в opencode/opencode.json (\"instructions\").\n" +
+                            "GitHub: ⚙ → GitHub (PAT с правами repo, workflow) — агент сможет создавать репозитории, Actions-раннеры (ubuntu-latest, там работают npm и opencode), следить за запусками и забирать логи/артефакты.\n" +
+                            "Подтверждения и лимит раундов: ⚙ → «Подтверждения» и «Раундов на ход».\n" +
+                            "Файл агенту: кнопка 📎 — файл копируется в проект и отправляется агенту.\n" +
+                            "Остановка: ⏹ — ход прерывается, но сессия и история сохраняются.",
+                    )
+                }
+                return
+            }
         }
 
         if (!requireConfigured()) return
+        lastPrompt = prompt
         _agentMessages.update { it + AgentItem.User(prompt) }
         runAgentTurn(prompt)
+    }
+
+    /** Re-runs the last prompt (shown next to errors). */
+    fun retryLast() {
+        val p = lastPrompt ?: return
+        if (_agentRunning.value || p.isEmpty()) return
+        if (!requireConfigured()) return
+        _agentMessages.update { it + AgentItem.User("$p (повтор)") }
+        runAgentTurn(p)
     }
 
     private fun requireConfigured(): Boolean {
@@ -319,15 +374,24 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         if (!config.isReady) return
         _agentRunning.value = true
         agentCancelled.set(false)
+        _agentSteps.value = 0
+        _turnStartedAt.value = System.currentTimeMillis()
+        val turnStart = _turnStartedAt.value
 
         agentExecutor.execute {
             val projectDir = _selected.value?.dir
-            val tools = OpenCodeTools(workspace, jsRuntime, npxRuntime, projectDir)
-            val agent = OpenCodeAgent(workspace, tools, { LlmClient(config) }, projectDir)
+            val tools = OpenCodeTools(workspace, jsRuntime, npxRuntime, projectDir, config.githubToken)
+            val agent = OpenCodeAgent(
+                workspace, tools, { LlmClient(config) }, projectDir,
+                maxSteps = config.safeMaxSteps,
+                askMode = config.confirmMode == AgentSettings.MODE_ASK,
+                hasGitHub = config.hasGitHub,
+            )
 
             // The session this turn belongs to; create one on demand.
             val session = _currentSession.value?.let { sessions.load(it.id) }
                 ?: sessions.create(project = projectName(), title = null, model = config.model)
+            registerTab(session.info)
 
             // Question tool: block this thread until the user answers in the UI.
             tools.questionAsker = { questions ->
@@ -346,6 +410,25 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 }
             }
 
+            // Manual mode: mutating tool calls wait for a tap in the UI.
+            if (config.confirmMode == AgentSettings.MODE_MANUAL) {
+                tools.toolApprover = { name, argsJson ->
+                    val latch = CountDownLatch(1)
+                    var approved = false
+                    _pendingApproval.value = PendingApproval(name, argsJson.take(300)) { ok ->
+                        approved = ok
+                        _pendingApproval.value = null
+                        latch.countDown()
+                    }
+                    if (!latch.await(10, TimeUnit.MINUTES)) {
+                        _pendingApproval.value = null
+                        false
+                    } else {
+                        approved
+                    }
+                }
+            }
+
             tools.onTodos = { list ->
                 session.todos = list
                 _todos.value = list
@@ -357,8 +440,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 when (event) {
                     is OpenCodeAgent.Event.AssistantText ->
                         _agentMessages.update { it + AgentItem.Assistant(event.text) }
-                    is OpenCodeAgent.Event.ToolStart ->
+                    is OpenCodeAgent.Event.ToolStart -> {
+                        _agentSteps.value = _agentSteps.value + 1
                         _agentMessages.update { it + AgentItem.Tool(event.name, event.args, null) }
+                    }
                     is OpenCodeAgent.Event.ToolDone ->
                         _agentMessages.update { items ->
                             val idx = items.indexOfLast { it is AgentItem.Tool && it.result == null && it.name == event.name }
@@ -385,7 +470,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 }
             }
 
-            // Persist the turn: history, todos, auto-title from the first message.
+            // Persist the turn: history, todos, auto-title from the first
+            // message. Runs even after cancellation — memory is preserved.
             session.messages = newHistory
             session.info.model = config.model
             if (session.info.title == "Новая сессия") {
@@ -396,8 +482,93 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             sessions.save(session)
             _currentSession.value = session.info
             refreshSessions()
+            val secs = (System.currentTimeMillis() - turnStart) / 1000
+            if (_agentSteps.value > 0 || agentCancelled.get()) {
+                _agentMessages.update {
+                    it + AgentItem.Info("⏱ раундов: ${_agentSteps.value} · время: ${secs}с · сессия сохранена")
+                }
+            }
             _agentRunning.value = false
         }
+    }
+
+    // ---------------------------------------------------------------- tabs
+
+    private fun registerTab(info: Sessions.SessionInfo) {
+        _openTabs.update { tabs -> if (tabs.any { it.id == info.id }) tabs.map { if (it.id == info.id) info else it } else tabs + info }
+    }
+
+    /** Opens (or switches to) a session tab. */
+    fun switchTab(id: String) {
+        if (_agentRunning.value) return
+        openSession(id)
+        val info = _sessionList.value.firstOrNull { it.id == id } ?: _openTabs.value.firstOrNull { it.id == id } ?: return
+        _openTabs.update { tabs ->
+            if (tabs.any { it.id == id }) tabs.map { if (it.id == id) info else it } else tabs + info
+        }
+    }
+
+    /** A fresh tab with its own new session. */
+    fun newTab() {
+        if (_agentRunning.value) return
+        newSession()
+        _currentSession.value?.let { registerTab(it) }
+    }
+
+    /** Closes the active tab and shows the neighbour (or an empty chat). */
+    fun closeCurrentTab() {
+        if (_agentRunning.value) return
+        val current = _currentSession.value ?: return
+        val tabs = _openTabs.value
+        val idx = tabs.indexOfFirst { it.id == current.id }
+        _openTabs.value = tabs.filterNot { it.id == current.id }
+        val next = tabs.getOrNull(idx + 1) ?: tabs.getOrNull(idx - 1)
+        if (next != null) {
+            switchTab(next.id)
+        } else {
+            _currentSession.value = null
+            _agentMessages.value = emptyList()
+            _todos.value = emptyList()
+        }
+    }
+
+    // ---------------------------------------------------------------- files
+
+    /**
+     * Sends a file to the agent: copies it into the project's attachments/
+     * folder and starts a turn so the agent can work with it (read/bash).
+     */
+    fun attachFile(uri: android.net.Uri) {
+        if (_agentRunning.value) return
+        val resolver = getApplication<Application>().contentResolver
+        val name = runCatching {
+            resolver.query(uri, null, null, null, null)?.use { c ->
+                val idx = c.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+                if (idx >= 0 && c.moveToFirst()) c.getString(idx) else null
+            }
+        }.getOrNull() ?: "file-${System.currentTimeMillis()}.bin"
+        val safe = name.replace(Regex("[^\\p{L}\\p{N}._-]"), "_").ifEmpty { "file.bin" }
+        val dir = File(_selected.value?.dir ?: workspace.root, "attachments").apply { mkdirs() }
+        val target = File(dir, safe)
+        val bytes = runCatching {
+            resolver.openInputStream(uri)?.use { ins -> target.outputStream().use { ins.copyTo(it) } }
+            target.length()
+        }.getOrNull()
+        if (bytes == null) {
+            _agentMessages.update { it + AgentItem.Error("Не удалось прочитать файл $name") }
+            return
+        }
+        val rel = workspace.relativeTo(target)
+        if (!canUseAgent() || !_llmConfig.value.isReady) {
+            _agentMessages.update { it + AgentItem.Info("Файл сохранён: $rel ($bytes байт). Настройте модель — и агент сможет с ним работать.") }
+            return
+        }
+        lastPrompt = null // retry doesn't apply to attachments
+        _agentMessages.update { it + AgentItem.User("📎 $rel ($bytes байт)") }
+        runAgentTurn(
+            "The user attached the file \"$rel\" ($bytes bytes) to the project. Inspect it (read the first lines if it is text) " +
+                "and briefly describe what it is and what can be done with it, then wait for instructions.",
+        )
     }
 
     private fun firstUserText(history: JSONArray): String? {
@@ -414,6 +585,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     fun cancelAgent() {
         agentCancelled.set(true)
         _pendingQuestion.value?.answer?.invoke("(отменено пользователем)")
+        _pendingApproval.value?.respond?.invoke(false)
     }
 
     // ---------------------------------------------------------------- projects

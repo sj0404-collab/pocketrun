@@ -18,6 +18,8 @@ class OpenCodeAgent(
     private val clientFactory: () -> LlmClient,
     private val projectDir: File?,
     private val maxSteps: Int = 12,
+    private val askMode: Boolean = false,
+    private val hasGitHub: Boolean = false,
 ) {
 
     sealed class Event {
@@ -131,7 +133,39 @@ class OpenCodeAgent(
             appendLine("- Use todowrite for multi-step tasks; keep the list current.")
             appendLine("- Ask the user with the question tool when requirements are ambiguous.")
             appendLine("- If a tool fails, read the error and adjust; do not repeat the same failing call more than twice.")
+            appendLine("- For workflows the user repeats, suggest saving a skill: a folder .opencode/skills/<name>/SKILL.md with `name` and `description` in YAML frontmatter — you can create it with apply_patch yourself, then load it with the skill tool.")
             appendLine("- Answer in the user's language (usually Russian). Be concise; show what you did.")
+            if (askMode) {
+                appendLine()
+                appendLine("# Clarification mode (user preference)")
+                appendLine("Before any non-trivial task, ask the user 1-3 short clarifying questions with the question tool (each with concrete answer options). Only proceed automatically when the request is completely unambiguous or you already asked in this session.")
+            }
+            if (hasGitHub) {
+                appendLine()
+                appendLine("# GitHub and Actions runners")
+                appendLine("The `github` tool talks to the GitHub REST API with the user's token. GitHub Actions runners are full Linux machines (ubuntu-latest): use them for anything the mobile sandbox cannot run — npm packages, opencode itself, compilers, heavy tests.")
+                appendLine("Runner pattern:")
+                appendLine("1. repo_create (private by default) → 2. push code + .github/workflows/run.yml → 3. dispatch → 4. poll runs (every call takes a few seconds; ask the user to wait or poll a few times) → 5. logs → 6. artifacts/artifact_download.")
+                appendLine("Example workflow the user can adapt:")
+                appendLine("```yaml")
+                appendLine("name: agent-runner")
+                appendLine("on: workflow_dispatch")
+                appendLine("jobs:")
+                appendLine("  run:")
+                appendLine("    runs-on: ubuntu-latest")
+                appendLine("    steps:")
+                appendLine("      - uses: actions/checkout@v4")
+                appendLine("      - uses: actions/setup-node@v4")
+                appendLine("        with: { node-version: 22 }")
+                appendLine("      - run: npm install")
+                appendLine("      # opencode inside the runner:")
+                appendLine("      - run: npm i -g opencode-ai && opencode run --model opencode/claude-sonnet-4-5 \"<task>\"")
+                appendLine("        env: { OPENCODE_API_KEY: '${'$'}{{ secrets.ZEN_KEY }}' }")
+                appendLine("      - uses: actions/upload-artifact@v4")
+                appendLine("        with: { name: out, path: out/ }")
+                appendLine("```")
+                appendLine("Never print or commit the user's tokens; reference secrets like \${{ secrets.NAME }} instead.")
+            }
             appendLine()
             appendLine("# Current todos")
             appendLine(todosBlock)
