@@ -69,8 +69,10 @@ object PythonRuntime {
     fun version(): String? = version
 
     private fun readVersion(py: Python): String? = try {
-        val info = py.getModule("pocketrun").callAttr("interpreter_info").asMap()
-        info["version"] as? String
+        py.getModule("pocketrun")
+            .callAttr("interpreter_info")
+            .get("version")
+            .toString()
     } catch (t: Throwable) {
         Log.w(TAG, "interpreter_info failed", t)
         null
