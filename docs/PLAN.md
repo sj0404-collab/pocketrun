@@ -16,7 +16,7 @@ CI: `.github/workflows/android.yml` — сборка APK и тесты в GitHub
 | Python | настоящий CPython 3.13 через Chaquopy | бутстрап + Kotlin-мост `PythonRuntime` готовы |
 | Node.js | Rhino + собственный Node-совместимый слой | не начато |
 | npx | свой: реестр npm + распаковка tar + запуск `bin` | не начато |
-| opencode | переписан на Kotlin: агент + инструменты + LLM-клиент | не начато |
+| opencode | инструменты, навыки, сессии и инструкции opencode-стиля (v1.3.0) | готово |
 | Релиз-ключ | Ed25519, офлайн-проверка, утилита keygen | **готово** |
 | Интерфейс | Jetpack Compose | MVP: активация → проекты → редактор+терминал → инфо |
 
@@ -211,17 +211,28 @@ tools/keygen/                         отдельный JVM-проект: genke
 * ограничение: пакеты с class/async/import или нативными аддонами не работают —
   при parse-ошибке печатается подсказка попробовать старую версию.
 
-### 4.4 Агент ✅ готово (v1.2.0)
+### 4.4 Агент ✅ готово (v1.3.0 — opencode-совместимый)
 
-* `agent/AgentSettings.kt` — SharedPreferences: base URL / API-ключ / модель
-  (любой OpenAI-совместимый endpoint);
-* `agent/LlmClient.kt` — `/chat/completions` без стриминга, tool calls в
-  OpenAI-формате;
-* `agent/AgentTools.kt` — `list_projects`, `list_dir`, `read_file`,
-  `write_file`, `search_files`, `run_python`, `run_node`, `run_npx`
-  (executeSync с таймаутами 60/60/180 с);
-* `agent/Agent.kt` — цикл ≤10 шагов: сообщение → tool calls → результаты →
-  повтор до текстового ответа; история между ходами, отмена между шагами;
+* `agent/opencode/OpenCodeTools.kt` — инструменты opencode: `bash`, `read`,
+  `write`, `edit`, `list`, `glob`, `grep`, `apply_patch`, `todowrite`,
+  `webfetch`, `skill`, `question` (без `lsp`/`websearch`);
+* `agent/opencode/MiniShell.kt` — мини-шелл для `bash`: ~26 встроенных команд,
+  кавычки, `&&`, `|`, `>` `>>`, плюс `python`/`node`/`npx` через рантаймы;
+* `agent/opencode/ApplyPatch.kt` — формат `*** Begin Patch` (Add/Update/Move
+  to/Delete File), толерантный к отступам и diff-стилю контекста;
+* `agent/opencode/Skills.kt` — SKILL.md-навыки: проект `.opencode/.claude/.agents
+  /skills/`, глобально `workspace/opencode/skills/`, XML `<available_skills>`;
+* `agent/opencode/Sessions.kt` — сессии `opencode-data/sessions/<id>.json`:
+  create/list/load/save/rename/fork/latest/export, todos;
+* `agent/opencode/Instructions.kt` — AGENTS.md/CLAUDE.md (проект + глобальный),
+  `instructions` из `opencode/opencode.json` (файлы и URL, 5 с);
+* `agent/opencode/OpenCodeAgent.kt` — цикл ≤12 шагов, системный промпт
+  opencode-стиля (правила + инструкции + todos);
+* `agent/AgentSettings.kt` — пресеты (OpenCode Zen, OpenAI, OpenRouter, Groq);
+* `agent/LlmClient.kt` — `/chat/completions` + `models()` (GET /models) для
+  живого списка моделей (в Zen 80+);
+* UI: панель сессий (resume/fork/rename/export/delete), панель todos,
+  интерактивные карточки `question`, команды `/new` и `/init`;
 * доступен только для планов с `canUseAgent` (pro) — гейт в UI и в ViewModel.
 
 ### 4.5 Интерфейс
