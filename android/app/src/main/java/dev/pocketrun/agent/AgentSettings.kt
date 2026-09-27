@@ -88,4 +88,29 @@ object AgentSettings {
             .putString("maxSteps", config.safeMaxSteps.toString())
             .apply()
     }
+
+    // ---------------------------------------------------------------- ui state
+
+    /**
+     * Which session tab was active and which tabs were open, so the agent
+     * chat comes back exactly as it was after the app is closed. Returns null
+     * when nothing was saved yet (first launch → continue the latest session).
+     */
+    data class UiState(val lastSessionId: String?, val openTabs: List<String>)
+
+    fun readUiState(context: Context): UiState? {
+        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        if (!prefs.contains("uiOpenTabs")) return null
+        val last = prefs.getString("uiLastSessionId", "")!!.takeIf { it.isNotBlank() }
+        val tabs = prefs.getString("uiOpenTabs", "")!!.split(',').filter { it.isNotBlank() }
+        return UiState(last, tabs)
+    }
+
+    fun saveUiState(context: Context, lastSessionId: String?, openTabs: List<String>) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .edit()
+            .putString("uiLastSessionId", lastSessionId ?: "")
+            .putString("uiOpenTabs", openTabs.joinToString(","))
+            .apply()
+    }
 }

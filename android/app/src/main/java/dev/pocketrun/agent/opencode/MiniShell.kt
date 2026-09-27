@@ -31,7 +31,7 @@ class MiniShell(
         const val MAX_FILE = 2 * 1024 * 1024
         val COMMANDS = listOf(
             "cat", "cd", "cp", "date", "echo", "env", "false", "find", "grep", "head",
-            "ls", "mkdir", "mv", "node", "npx", "pwd", "python", "rm", "sleep", "tail",
+            "ls", "mkdir", "mv", "node", "npm", "npx", "pwd", "python", "rm", "sleep", "tail",
             "touch", "true", "uname", "wc", "which", "help",
         )
         private val HELP = """
@@ -39,6 +39,9 @@ class MiniShell(
             python <file.py> | python -c '<код>'   — CPython 3.13 (стандартная библиотека)
             node <file.js>  | node -e '<код>'      — Node-совместимый слой (без class/async/import)
             npx <пакет> [аргументы]               — чистые JS npm-пакеты
+            npm init -y | npm install <пакет> | npm run <script> | npm ls
+                                                   — управление node-проектом (install качает
+                                                     чистые JS-пакеты; require() их видит)
             Поддерживаются кавычки, && , | и > >> для встроенных команд.
         """.trimIndent()
     }
@@ -135,6 +138,7 @@ class MiniShell(
                 "python", "python3" -> runPython(args, dir, timeoutMs)
                 "node" -> runNode(args, dir, timeoutMs)
                 "npx" -> runNpx(args, dir, timeoutMs)
+            "npm" -> npm(args, dir, timeoutMs)
                 else -> runBuiltin(cmd, args, dir, input, onCd)
             }
             exit = r.exitCode
@@ -432,6 +436,107 @@ class MiniShell(
             timeoutMs,
         )
         return Result(r.exitCode, r.stdout + (if (r.stderr.isNotBlank()) r.stderr else ""))
+    }
+
+    // ---------------------------------------------------------------- npm
+
+    /**
+     * A minimal `npm` for the sandbox: init creates package.json, install
+     * downloads pure-JS packages (into the shared store, which require()
+     * already resolves), run executes package.json scripts through this shell.
+     */
+    private fun npm(args: List<String>, dir: File, timeoutMs: Long): Result {
+        val sub = args.firstOrNull() ?: return Result(1, "npm: нужна подкоманда: init, install, run, test, ls\n")
+        val rest = args.drop(1)
+        return try {
+            when (sub) {
+                "init" -> npmInit(rest, dir)
+                "install", "i", "add" -> npmInstall(rest, dir)
+                "run" -> npmRun(rest, dir, timeoutMs)
+                "test" -> npmRun(listOf("test"), dir, timeoutMs)
+                "ls", "list" -> npmLs(dir)
+                "--version", "-v" -> Result(0, "npm (PocketRun) — init / install / run / test / ls\n")
+                else -> Result(1, "npm: неизвестная подкоманда '$sub' (есть: init, install, run, test, ls)\n")
+            }
+        } catch (t: Throwable) {
+            Result(1, "npm: ${t.message ?: t.javaClass.simpleName}\n")
+        }
+    }
+
+    private fun npmInit(args: List<String>, dir: File): Result {
+        val pkg = File(dir, "package.json")
+        if (pkg.isFile && args.none { it == "-y" || it == "--yes" || it == "-f" || it == "--force" }) {
+            return Result(1, "npm: package.json уже существует (npm init -y чтобы перезаписать)\n")
+        }
+        val json = org.json.JSONObject()
+            .put("name", dir.name.replace(Regex("[^a-z0-9-]"), "-").trim('-').ifEmpty { "project" })
+            .put("version", "1.0.0")
+            .put("description", "")
+            .put("main", "index.js")
+            .put(
+                "scripts",
+                org.json.JSONObject().put("test", "echo \"Error: no test specified\" && exit 1"),
+            )
+        pkg.writeText(json.toString(2) + "\n", Charsets.UTF_8)
+        return Result(0, "создан package.json (${json.optString("name")})\n")
+    }
+
+    private fun npmInstall(args: List<String>, dir: File): Result {
+        val pkg = File(dir, "package.json")
+        val manifest = if (pkg.isFile) org.json.JSONObject(pkg.readText(Charsets.UTF_8)) else org.json.JSONObject()
+        val specs = args.filter { !it.startsWith("-") }
+        val toInstall: List<Pair<String, String?>> = if (specs.isEmpty()) {
+            // no arguments: install everything from package.json dependencies
+            val deps = manifest.optJSONObject("dependencies")
+                ?: return Result(1, "npm: нет пакетов для установки и нет dependencies в package.json\n")
+            deps.keys().asSequence().map { it to deps.optString(it).takeIf { r -> r != "*" } }.toList()
+        } else {
+            specs.mapNotNull { raw ->
+                NpxRuntime.parseSpec(raw)?.let { it.name to it.version }
+            }.ifEmpty { return Result(1, "npm: не удалось разобрать имена пакетов\n") }
+        }
+        val out = StringBuilder()
+        for ((name, version) in toInstall) {
+            val installed = npxRuntime.install(
+                NpxRuntime.PackageSpec(name, version),
+                log = { line -> out.append(line).append('\n') },
+            )
+            val actual = org.json.JSONObject(File(installed, "package.json").readText(Charsets.UTF_8)).optString("version")
+            val deps = manifest.optJSONObject("dependencies") ?: org.json.JSONObject().also { manifest.put("dependencies", it) }
+            deps.put(name, actual)
+            out.append("✓ ").append(name).append('@').append(actual).append('\n')
+        }
+        if (pkg.isFile || toInstall.isNotEmpty()) {
+            manifest.put("dependencies", manifest.optJSONObject("dependencies") ?: org.json.JSONObject())
+            pkg.writeText(manifest.toString(2) + "\n", Charsets.UTF_8)
+        }
+        return Result(0, cap(out.toString()))
+    }
+
+    private fun npmRun(args: List<String>, dir: File, timeoutMs: Long): Result {
+        val pkg = File(dir, "package.json")
+        if (!pkg.isFile) return Result(1, "npm run: нет package.json в текущем каталоге\n")
+        val manifest = org.json.JSONObject(pkg.readText(Charsets.UTF_8))
+        val scripts = manifest.optJSONObject("scripts")
+            ?: return Result(1, "npm run: в package.json нет секции scripts\n")
+        val script = args.firstOrNull()
+            ?: return Result(0, "доступные скрипты:\n" + scripts.keys().asSequence().joinToString("\n") { "  $it" } + "\n")
+        val cmd = scripts.optString(script).takeIf { it.isNotEmpty() }
+            ?: return Result(1, "npm run: нет скрипта \"$script\" (есть: ${scripts.keys().asSequence().joinToString(", ")})\n")
+        val r = execute(cmd, dir, timeoutMs)
+        return Result(r.exitCode, r.output)
+    }
+
+    private fun npmLs(dir: File): Result {
+        val out = StringBuilder()
+        val local = File(dir, "node_modules").takeIf { it.isDirectory }
+        if (local != null) {
+            out.append("локальные (node_modules):\n")
+            local.listFiles()?.sortedBy { it.name }?.forEach { out.append("  ${it.name}\n") }
+        }
+        out.append("установленные пакеты (общий стор, виден из require):\n")
+        npxRuntime.installedPackages().forEach { (n, v) -> out.append("  $n@$v\n") }
+        return Result(0, out.toString().ifEmpty { "(ничего не установлено)\n" })
     }
 
     private fun runCodeFile(ext: String, code: String, dir: File, timeoutMs: Long, python: Boolean): Result {

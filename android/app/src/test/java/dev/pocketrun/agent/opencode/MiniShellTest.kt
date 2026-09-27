@@ -132,6 +132,50 @@ class MiniShellTest {
     }
 
     @Test
+    fun npmInitAndRun() {
+        val ws = Workspace.at(tmp.newFolder())
+        val sh = newShell(ws)
+        val proj = File(ws.root, "proj").apply { mkdirs() }
+        val init = sh.execute("npm init -y", proj)
+        assertEquals(0, init.exitCode)
+        val pkg = File(proj, "package.json")
+        assertTrue(pkg.isFile)
+        assertTrue(pkg.readText().contains("\"name\": \"proj\""))
+
+        // npm run executes package.json scripts through the shell
+        val manifest = org.json.JSONObject(pkg.readText())
+        manifest.getJSONObject("scripts").put("hello", "echo hi-from-script")
+        pkg.writeText(manifest.toString())
+        val run = sh.execute("npm run hello", proj)
+        assertEquals(0, run.exitCode)
+        assertTrue(run.output.contains("hi-from-script"))
+
+        // npm run without args lists scripts; unknown script fails
+        assertTrue(sh.execute("npm run", proj).output.contains("hello"))
+        assertTrue(sh.execute("npm run nope", proj).exitCode != 0)
+
+        // init refuses to overwrite without -y
+        assertTrue(sh.execute("npm init", proj).exitCode != 0)
+        assertEquals(0, sh.execute("npm init -y", proj).exitCode)
+    }
+
+    @Test
+    fun npmLsListsInstalled() {
+        val ws = Workspace.at(tmp.newFolder())
+        val sh = newShell(ws)
+        val r = sh.execute("npm ls", ws.root)
+        assertEquals(0, r.exitCode)
+        assertTrue(r.output.isNotEmpty())
+    }
+
+    @Test
+    fun npmUnknownSubcommand() {
+        val ws = Workspace.at(tmp.newFolder())
+        val sh = newShell(ws)
+        assertTrue(sh.execute("npm dance", ws.root).exitCode != 0)
+    }
+
+    @Test
     fun unknownCommandFails() {
         val ws = Workspace.at(tmp.newFolder())
         val sh = newShell(ws)

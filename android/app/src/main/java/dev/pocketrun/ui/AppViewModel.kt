@@ -216,6 +216,19 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun projectName(): String? = _selected.value?.name
 
+    /** Loads a session into the chat without the running-guard (startup, tabs). */
+    private fun showSession(id: String) {
+        val session = sessions.load(id) ?: return
+        _currentSession.value = session.info
+        _todos.value = session.todos
+        _agentMessages.value = historyToItems(session.messages)
+    }
+
+    /** Remembers the active tab and open tabs for the next app launch. */
+    private fun persistAgentUi() {
+        AgentSettings.saveUiState(getApplication(), _currentSession.value?.id, _openTabs.value.map { it.id })
+    }
+
     /** `/new` — starts a fresh session for the current project. */
     fun newSession() {
         if (_agentRunning.value) return
@@ -223,17 +236,17 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         _currentSession.value = session.info
         _agentMessages.value = emptyList()
         _todos.value = emptyList()
+        registerTab(session.info)
         refreshSessions()
+        persistAgentUi()
     }
 
     /** Resumes a stored session: history and todos come back into the chat. */
     fun openSession(id: String) {
         if (_agentRunning.value) return
-        val session = sessions.load(id) ?: return
-        _currentSession.value = session.info
-        _todos.value = session.todos
-        _agentMessages.value = historyToItems(session.messages)
+        showSession(id)
         refreshSessions()
+        persistAgentUi()
     }
 
     fun forkSession(id: String) {
@@ -242,24 +255,36 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             _currentSession.value = child.info
             _todos.value = child.todos
             _agentMessages.value = historyToItems(child.messages)
+            registerTab(child.info)
         }
         refreshSessions()
+        persistAgentUi()
     }
 
     fun renameSession(id: String, title: String) {
         sessions.rename(id, title)
-        if (_currentSession.value?.id == id) _currentSession.value = sessions.list().firstOrNull { it.id == id } ?: _currentSession.value
+        val updated = sessions.list().firstOrNull { it.id == id }
+        if (updated != null) {
+            _openTabs.value = _openTabs.value.map { if (it.id == id) updated else it }
+            if (_currentSession.value?.id == id) _currentSession.value = updated
+        }
         refreshSessions()
+        persistAgentUi()
     }
 
     fun deleteSession(id: String) {
         sessions.delete(id)
+        _openTabs.value = _openTabs.value.filterNot { it.id == id }
         if (_currentSession.value?.id == id) {
-            _currentSession.value = null
-            _agentMessages.value = emptyList()
-            _todos.value = emptyList()
+            val next = _openTabs.value.firstOrNull()
+            if (next != null) showSession(next.id) else {
+                _currentSession.value = null
+                _agentMessages.value = emptyList()
+                _todos.value = emptyList()
+            }
         }
         refreshSessions()
+        persistAgentUi()
     }
 
     /** `opencode export` analog: writes the session to opencode-data/exports/. */
@@ -482,6 +507,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             sessions.save(session)
             _currentSession.value = session.info
             refreshSessions()
+            persistAgentUi()
             val secs = (System.currentTimeMillis() - turnStart) / 1000
             if (_agentSteps.value > 0 || agentCancelled.get()) {
                 _agentMessages.update {
@@ -501,18 +527,20 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     /** Opens (or switches to) a session tab. */
     fun switchTab(id: String) {
         if (_agentRunning.value) return
-        openSession(id)
-        val info = _sessionList.value.firstOrNull { it.id == id } ?: _openTabs.value.firstOrNull { it.id == id } ?: return
-        _openTabs.update { tabs ->
-            if (tabs.any { it.id == id }) tabs.map { if (it.id == id) info else it } else tabs + info
-        }
+        showSession(id)
+        val info = _sessionList.value.firstOrNull { it.id == id }
+            ?: _openTabs.value.firstOrNull { it.id == id }
+            ?: sessions.load(id)?.info
+            ?: return
+        registerTab(info)
+        refreshSessions()
+        persistAgentUi()
     }
 
     /** A fresh tab with its own new session. */
     fun newTab() {
         if (_agentRunning.value) return
-        newSession()
-        _currentSession.value?.let { registerTab(it) }
+        newSession() // registers the tab and persists itself
     }
 
     /** Closes the active tab and shows the neighbour (or an empty chat). */
@@ -524,12 +552,13 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         _openTabs.value = tabs.filterNot { it.id == current.id }
         val next = tabs.getOrNull(idx + 1) ?: tabs.getOrNull(idx - 1)
         if (next != null) {
-            switchTab(next.id)
+            showSession(next.id)
         } else {
             _currentSession.value = null
             _agentMessages.value = emptyList()
             _todos.value = emptyList()
         }
+        persistAgentUi()
     }
 
     // ---------------------------------------------------------------- files
@@ -593,6 +622,34 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     init {
         refreshProjects()
         if (_projects.value.isEmpty()) createProject("hello")
+        restoreAgentUi()
+    }
+
+    /**
+     * Brings the agent chat back after the app was closed: the tabs that were
+     * open and the active session, with history and todos. First launch (no
+     * saved UI state) continues the most recent session, like `opencode -c`.
+     * If the user closed all tabs on purpose, the chat starts empty.
+     */
+    private fun restoreAgentUi() {
+        val existing = sessions.list().associateBy { it.id }
+        val ui = AgentSettings.readUiState(getApplication())
+        when {
+            ui != null && ui.openTabs.isNotEmpty() -> {
+                _openTabs.value = ui.openTabs.mapNotNull { existing[it] }
+                val activeId = ui.lastSessionId?.takeIf { existing.containsKey(it) }
+                    ?: _openTabs.value.firstOrNull()?.id
+                if (activeId != null) showSession(activeId)
+            }
+            ui == null -> {
+                // nothing saved yet (first run after update): continue latest
+                sessions.list().firstOrNull()?.let { latest ->
+                    _openTabs.value = listOf(latest)
+                    showSession(latest.id)
+                }
+            }
+            else -> Unit // the user closed all tabs — keep the chat empty
+        }
     }
 
     fun refreshProjects() {
