@@ -1,6 +1,7 @@
 package dev.pocketrun.keygen
 
 import net.i2p.crypto.eddsa.EdDSAPrivateKey
+import net.i2p.crypto.eddsa.EdDSAPublicKey
 import net.i2p.crypto.eddsa.EdDSASecurityProvider
 import net.i2p.crypto.eddsa.spec.EdDSANamedCurveTable
 import net.i2p.crypto.eddsa.spec.EdDSAPublicKeySpec
@@ -28,6 +29,16 @@ object Ed25519 {
 
     fun generateKeyPair(): KeyPair = keyPairFromSeed(randomSeed())
 
+    /**
+     * Returns the 32-byte seed together with its keypair. The seed is what gets
+     * stored in license.key; [java.security.PrivateKey.getEncoded] is not usable
+     * for that, so the seed is threaded through explicitly.
+     */
+    fun generate(): Pair<ByteArray, KeyPair> {
+        val seed = randomSeed()
+        return seed to keyPairFromSeed(seed)
+    }
+
     fun randomSeed(): ByteArray = ByteArray(32).also { random.nextBytes(it) }
 
     fun keyPairFromSeed(seed: ByteArray): KeyPair {
@@ -47,7 +58,12 @@ object Ed25519 {
         .getInstance("EdDSA", PROVIDER_INSTANCE)
         .generatePublic(EdDSAPublicKeySpec(encoded, spec))
 
-    fun encodePublicKey(publicKey: PublicKey): ByteArray = publicKey.encoded
+    /**
+     * The 32 raw key bytes. [java.security.PublicKey.getEncoded] would give the
+     * 44-byte X.509 SubjectPublicKeyInfo, which is not what gets embedded in the
+     * app and not what [publicKeyFromRaw] accepts.
+     */
+    fun encodePublicKey(publicKey: PublicKey): ByteArray = (publicKey as EdDSAPublicKey).abyte
 
     fun sign(privateKey: PrivateKey, message: ByteArray): ByteArray =
         Signature.getInstance(SIGNATURE_ALGORITHM, PROVIDER_INSTANCE).run {
