@@ -91,6 +91,8 @@ fun AgentScreen(viewModel: AppViewModel) {
     val pendingApproval by viewModel.pendingApproval.collectAsState()
     val tabs by viewModel.openTabs.collectAsState()
     val steps by viewModel.agentSteps.collectAsState()
+    val rounds by viewModel.agentRounds.collectAsState()
+    val preview by viewModel.modelPreview.collectAsState()
     val turnStartedAt by viewModel.turnStartedAt.collectAsState()
 
     var input by remember { mutableStateOf("") }
@@ -217,23 +219,39 @@ fun AgentScreen(viewModel: AppViewModel) {
             }
             if (running) {
                 item {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        modifier = Modifier.padding(start = 8.dp),
-                    ) {
-                        CircularProgressIndicator(Modifier.size(14.dp), strokeWidth = 2.dp)
-                        Spacer(Modifier.width(8.dp))
-                        Text(
-                            "агент работает… · раунд $steps · %d:%02d".format(elapsed / 60, elapsed % 60),
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
+                    Column(Modifier.padding(start = 8.dp)) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            CircularProgressIndicator(Modifier.size(14.dp), strokeWidth = 2.dp)
+                            Spacer(Modifier.width(8.dp))
+                            Text(
+                                "агент работает… · раунд $rounds · вызовов $steps · %d:%02d".format(elapsed / 60, elapsed % 60),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        // While the model streams, show what it has written: a long
+                        // generation must not look like a frozen app.
+                        if (preview.isNotBlank()) {
+                            Text(
+                                preview.takeLast(240),
+                                style = MaterialTheme.typography.bodySmall,
+                                fontFamily = FontFamily.Monospace,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 4,
+                                overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                            )
+                        }
                     }
                 }
             }
             if (!running && messages.lastOrNull() is AppViewModel.AgentItem.Error) {
                 item {
-                    TextButton(onClick = viewModel::retryLast) { Text("↻ Повторить последний запрос") }
+                    Row {
+                        TextButton(onClick = viewModel::retryLast) { Text("↻ Повторить") }
+                        TextButton(onClick = viewModel::continueLast) { Text("→ Продолжить (/continue)") }
+                    }
                 }
             }
         }
@@ -869,9 +887,11 @@ private fun LlmSettingsDialog(
                 )
                 OutlinedTextField(
                     value = maxSteps,
-                    onValueChange = { maxSteps = it.filter { c -> c.isDigit() }.take(2) },
+                    onValueChange = { maxSteps = it.filter { c -> c.isDigit() }.take(3) },
                     label = { Text("Раундов на ход (1–${AgentSettings.MAX_STEPS_LIMIT})") },
-                    supportingText = { Text("сколько tool-циклов может сделать агент за один запрос") },
+                    supportingText = {
+                        Text("сколько model-раундов агент может сделать за один запрос (по умолчанию ${AgentSettings.DEFAULT_MAX_STEPS})")
+                    },
                     singleLine = true,
                 )
 

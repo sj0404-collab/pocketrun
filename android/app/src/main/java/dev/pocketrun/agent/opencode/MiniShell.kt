@@ -29,6 +29,9 @@ class MiniShell(
     companion object {
         const val MAX_OUTPUT = 32 * 1024
         const val MAX_FILE = 2 * 1024 * 1024
+
+        /** `sleep` in the sandbox: long enough to wait for a job, short enough not to hang a turn. */
+        const val MAX_SLEEP_SECONDS = 120f
         val COMMANDS = listOf(
             "cat", "cd", "cp", "date", "echo", "env", "false", "find", "grep", "head",
             "ls", "mkdir", "mv", "node", "npm", "npx", "pwd", "python", "rm", "sleep", "tail",
@@ -39,9 +42,10 @@ class MiniShell(
             python <file.py> | python -c '<код>'   — CPython 3.13 (стандартная библиотека)
             node <file.js>  | node -e '<код>'      — Node-совместимый слой (без class/async/import)
             npx <пакет> [аргументы]               — чистые JS npm-пакеты
-            npm init -y | npm install <пакет> | npm run <script> | npm ls
+            npm init -y | npm install <пакет> | npm run <скрипт> | npm ls
                                                    — управление node-проектом (install качает
                                                      чистые JS-пакеты; require() их видит)
+            sleep <секунды>                       — пауза (максимум ${MAX_SLEEP_SECONDS.toInt()} с)
             Поддерживаются кавычки, && , | и > >> для встроенных команд.
         """.trimIndent()
     }
@@ -51,7 +55,7 @@ class MiniShell(
     }
 
     /** Executes [commandLine] with [cwd] as the working directory. */
-    fun execute(commandLine: String, cwd: File, timeoutMs: Long = 120_000): Result {
+    fun execute(commandLine: String, cwd: File, timeoutMs: Long = OpenCodeTools.BASH_TIMEOUT_MS): Result {
         var dir = if (cwd.isDirectory) cwd else workspace.root
         val segments = splitAnd(commandLine)
         if (segments.isEmpty()) return Result(0, "")
@@ -138,7 +142,7 @@ class MiniShell(
                 "python", "python3" -> runPython(args, dir, timeoutMs)
                 "node" -> runNode(args, dir, timeoutMs)
                 "npx" -> runNpx(args, dir, timeoutMs)
-            "npm" -> npm(args, dir, timeoutMs)
+                "npm" -> npm(args, dir, timeoutMs)
                 else -> runBuiltin(cmd, args, dir, input, onCd)
             }
             exit = r.exitCode
@@ -197,8 +201,8 @@ class MiniShell(
             "date" -> Result(0, SimpleDateFormat("EEE MMM dd HH:mm:ss yyyy", Locale.US).format(Date()) + "\n")
             "sleep" -> {
                 val sec = args.firstOrNull()?.toFloatOrNull() ?: return Result(1, "sleep: нужен аргумент в секундах\n")
-                if (sec > 30f) return Result(1, "sleep: максимум 30 секунд\n")
-                Thread.sleep((sec * 1000).toLong())
+                if (sec > MAX_SLEEP_SECONDS) return Result(1, "sleep: максимум ${MAX_SLEEP_SECONDS.toInt()} секунд\n")
+                if (sec > 0) Thread.sleep((sec * 1000).toLong())
                 Result(0, "")
             }
             "uname" -> Result(0, "Linux aarch64 PocketRun\n")

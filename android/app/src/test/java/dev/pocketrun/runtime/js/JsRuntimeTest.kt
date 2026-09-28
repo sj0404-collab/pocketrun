@@ -154,20 +154,24 @@ class JsRuntimeTest {
         val workspace = Workspace.at(tmp.newFolder())
         val result = run(
             workspace,
+            // The delays are far apart on purpose: a timer is due "now + delay",
+            // so a slow machine that takes longer than the smaller delay to
+            // execute this script legitimately runs the bigger one first, and
+            // the assertion below would be testing the load, not the runtime.
             """
             var order = [];
             process.nextTick(function () { order.push('tick'); });
             setImmediate(function () { order.push('immediate'); });
-            setTimeout(function () { order.push('t10'); }, 10);
-            setTimeout(function () { order.push('t5'); }, 5);
-            setInterval(function () { order.push('boom'); }, 50);
-            setTimeout(function () { console.log('RESULT ' + order.join(',')); process.exit(7); }, 40);
+            setTimeout(function () { order.push('t20'); }, 20);
+            setTimeout(function () { order.push('t200'); }, 200);
+            setInterval(function () { order.push('boom'); }, 400);
+            setTimeout(function () { console.log('RESULT ' + order.join(',')); process.exit(7); }, 300);
             """.trimIndent(),
         )
         assertEquals("stderr: ${result.stderr}", 7, result.exitCode)
         val out = result.stdout.trim()
-        assertTrue("stdout: $out", out.contains("RESULT tick,immediate,t5,t10"))
-        // the 50ms interval must not fire before the 40ms exit timer
+        assertTrue("stdout: $out", out.contains("RESULT tick,immediate,t20,t200"))
+        // the 400ms interval must not fire before the 300ms exit timer
         assertTrue("interval fired too early: $out", !out.contains("boom"))
     }
 

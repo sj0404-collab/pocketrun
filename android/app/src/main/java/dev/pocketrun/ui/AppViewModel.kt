@@ -161,9 +161,16 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private val _pendingApproval = MutableStateFlow<PendingApproval?>(null)
     val pendingApproval: StateFlow<PendingApproval?> = _pendingApproval.asStateFlow()
 
-    /** Live counters of the running turn: rounds done and when it started. */
+    /** Live counters of the running turn: tool calls done and model rounds used. */
     private val _agentSteps = MutableStateFlow(0)
     val agentSteps: StateFlow<Int> = _agentSteps.asStateFlow()
+
+    private val _agentRounds = MutableStateFlow(0)
+    val agentRounds: StateFlow<Int> = _agentRounds.asStateFlow()
+
+    /** What the model is streaming right now, so a long generation is not silence. */
+    private val _modelPreview = MutableStateFlow("")
+    val modelPreview: StateFlow<String> = _modelPreview.asStateFlow()
 
     private val _turnStartedAt = MutableStateFlow(0L)
     val turnStartedAt: StateFlow<Long> = _turnStartedAt.asStateFlow()
@@ -340,6 +347,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 )
                 return
             }
+            "/continue" -> {
+                if (!requireConfigured()) return
+                _agentMessages.update { it + AgentItem.User("/continue") }
+                runAgentTurn(OpenCodeAgent.CONTINUE_PROMPT)
+                return
+            }
             "/skills" -> {
                 val found = dev.pocketrun.agent.opencode.Skills(workspace).discover(_selected.value?.dir)
                 _agentMessages.update {
@@ -353,13 +366,13 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             "/help" -> {
                 _agentMessages.update {
                     it + AgentItem.Info(
-                        "Команды: /new — новая сессия · /init — создать AGENTS.md · /skills — список навыков · /help — эта справка.\n\n" +
+                        "Команды: /new — новая сессия · /init — создать AGENTS.md · /continue — продолжить прерванный ход · /skills — список навыков · /help — эта справка.\n\n" +
                             "Навыки: создайте .opencode/skills/<имя>/SKILL.md (frontmatter: name, description) — агент подхватит и сможет загружать; глобальные — workspace/opencode/skills/.\n" +
                             "Инструкции: AGENTS.md в проекте + глобальный opencode/AGENTS.md, фолбэк CLAUDE.md; список файлов/URL — в opencode/opencode.json (\"instructions\").\n" +
-                            "GitHub: ⚙ → GitHub (PAT с правами repo, workflow) — агент сможет создавать репозитории, Actions-раннеры (ubuntu-latest, там работают npm и opencode), следить за запусками и забирать логи/артефакты.\n" +
-                            "Подтверждения и лимит раундов: ⚙ → «Подтверждения» и «Раундов на ход».\n" +
+                            "GitHub: ⚙ → GitHub (PAT с правами repo, workflow) — агент сможет создавать репозитории, Actions-раннеры (ubuntu-latest, там работают npm и opencode), запускать сборку и ждать её через github run_wait (одним вызовом, с логами при падении), забирать артефакты.\n" +
+                            "Подтверждения и лимит раундов: ⚙ → «Подтверждения» и «Раундов на ход». Долгие сборки и ожидание — это нормально: раундов по умолчанию 40.\n" +
                             "Файл агенту: кнопка 📎 — файл копируется в проект и отправляется агенту.\n" +
-                            "Остановка: ⏹ — ход прерывается, но сессия и история сохраняются.",
+                            "Остановка: ⏹ — ход прерывается, но сессия и история сохраняются (/continue продолжает).",
                     )
                 }
                 return
@@ -381,6 +394,17 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         runAgentTurn(p)
     }
 
+    /**
+     * Picks a stopped turn back up: the history, todos and every file the
+     * agent already touched are in place, so "продолжай" is all it needs.
+     */
+    fun continueLast() {
+        if (_agentRunning.value) return
+        if (!requireConfigured()) return
+        _agentMessages.update { it + AgentItem.User("/continue") }
+        runAgentTurn(OpenCodeAgent.CONTINUE_PROMPT)
+    }
+
     private fun requireConfigured(): Boolean {
         if (!canUseAgent()) {
             _agentMessages.update { it + AgentItem.Error("Агент доступен на плане Pro — активируйте Pro-лицензию.") }
@@ -400,121 +424,137 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         _agentRunning.value = true
         agentCancelled.set(false)
         _agentSteps.value = 0
+        _agentRounds.value = 0
+        _modelPreview.value = ""
         _turnStartedAt.value = System.currentTimeMillis()
         val turnStart = _turnStartedAt.value
 
         agentExecutor.execute {
-            val projectDir = _selected.value?.dir
-            val tools = OpenCodeTools(workspace, jsRuntime, npxRuntime, projectDir, config.githubToken)
-            val agent = OpenCodeAgent(
-                workspace, tools, { LlmClient(config) }, projectDir,
-                maxSteps = config.safeMaxSteps,
-                askMode = config.confirmMode == AgentSettings.MODE_ASK,
-                hasGitHub = config.hasGitHub,
-            )
+            try {
+                val projectDir = _selected.value?.dir
+                val tools = OpenCodeTools(workspace, jsRuntime, npxRuntime, projectDir, config.githubToken)
+                val agent = OpenCodeAgent(
+                    workspace, tools, { LlmClient(config) }, projectDir,
+                    maxSteps = config.safeMaxSteps,
+                    askMode = config.confirmMode == AgentSettings.MODE_ASK,
+                    hasGitHub = config.hasGitHub,
+                    isCancelled = { agentCancelled.get() },
+                )
 
-            // The session this turn belongs to; create one on demand.
-            val session = _currentSession.value?.let { sessions.load(it.id) }
-                ?: sessions.create(project = projectName(), title = null, model = config.model)
-            registerTab(session.info)
+                // The session this turn belongs to; create one on demand.
+                val session = _currentSession.value?.let { sessions.load(it.id) }
+                    ?: sessions.create(project = projectName(), title = null, model = config.model)
+                registerTab(session.info)
 
-            // Question tool: block this thread until the user answers in the UI.
-            tools.questionAsker = { questions ->
-                val latch = CountDownLatch(1)
-                var answer: String? = null
-                _pendingQuestion.value = PendingQuestion(questions) { text ->
-                    answer = text
-                    _pendingQuestion.value = null
-                    latch.countDown()
-                }
-                if (latch.await(10, TimeUnit.MINUTES)) {
-                    answer ?: "(нет ответа)"
-                } else {
-                    _pendingQuestion.value = null
-                    "(ответа не последовало)"
-                }
-            }
-
-            // Manual mode: mutating tool calls wait for a tap in the UI.
-            if (config.confirmMode == AgentSettings.MODE_MANUAL) {
-                tools.toolApprover = { name, argsJson ->
+                // Question tool: block this thread until the user answers in the UI.
+                tools.questionAsker = { questions ->
                     val latch = CountDownLatch(1)
-                    var approved = false
-                    _pendingApproval.value = PendingApproval(name, argsJson.take(300)) { ok ->
-                        approved = ok
-                        _pendingApproval.value = null
+                    var answer: String? = null
+                    _pendingQuestion.value = PendingQuestion(questions) { text ->
+                        answer = text
+                        _pendingQuestion.value = null
                         latch.countDown()
                     }
-                    if (!latch.await(10, TimeUnit.MINUTES)) {
-                        _pendingApproval.value = null
-                        false
+                    if (latch.await(10, TimeUnit.MINUTES)) {
+                        answer ?: "(нет ответа)"
                     } else {
-                        approved
+                        _pendingQuestion.value = null
+                        "(ответа не последовало)"
                     }
                 }
-            }
 
-            tools.onTodos = { list ->
-                session.todos = list
-                _todos.value = list
-            }
-            tools.todos = session.todos
-
-            agent.cancelled = agentCancelled.get()
-            val newHistory = agent.run(userText, session.messages) { event ->
-                when (event) {
-                    is OpenCodeAgent.Event.AssistantText ->
-                        _agentMessages.update { it + AgentItem.Assistant(event.text) }
-                    is OpenCodeAgent.Event.ToolStart -> {
-                        _agentSteps.value = _agentSteps.value + 1
-                        _agentMessages.update { it + AgentItem.Tool(event.name, event.args, null) }
-                    }
-                    is OpenCodeAgent.Event.ToolDone ->
-                        _agentMessages.update { items ->
-                            val idx = items.indexOfLast { it is AgentItem.Tool && it.result == null && it.name == event.name }
-                            if (idx >= 0) items.toMutableList().also { list -> list[idx] = (list[idx] as AgentItem.Tool).copy(result = event.result) }
-                            else items + AgentItem.Tool(event.name, "", event.result)
+                // Manual mode: mutating tool calls wait for a tap in the UI.
+                if (config.confirmMode == AgentSettings.MODE_MANUAL) {
+                    tools.toolApprover = { name, argsJson ->
+                        val latch = CountDownLatch(1)
+                        var approved = false
+                        _pendingApproval.value = PendingApproval(name, argsJson.take(300)) { ok ->
+                            approved = ok
+                            _pendingApproval.value = null
+                            latch.countDown()
                         }
-                    is OpenCodeAgent.Event.Question ->
-                        _agentMessages.update { it + AgentItem.Info("агент ждёт ответа на вопрос…") }
-                    is OpenCodeAgent.Event.Todos ->
-                        _todos.value = event.todos
-                    is OpenCodeAgent.Event.Failed -> {
-                        _agentMessages.update { it + AgentItem.Error(event.message) }
-                        // Zen refuses keyless requests with 403 even for free
-                        // models — tell the user where the free key lives.
-                        if (config.isZen && "403" in event.message) {
-                            _agentMessages.update {
-                                it + AgentItem.Info(
-                                    "Zen требует ключ даже для бесплатных моделей — получите его бесплатно на opencode.ai/auth " +
-                                        "(кнопка ⚙ над чатом). Бесплатные модели не расходуют кредиты.",
-                                )
+                        if (latch.await(10, TimeUnit.MINUTES)) {
+                            approved
+                        } else {
+                            _pendingApproval.value = null
+                            false
+                        }
+                    }
+                }
+
+                tools.onTodos = { list ->
+                    session.todos = list
+                    _todos.value = list
+                }
+                tools.todos = session.todos
+                // A waiting tool (github run_wait) must notice ⏹ as well.
+                tools.cancelCheck = { agentCancelled.get() }
+
+                val newHistory = agent.run(userText, session.messages) { event ->
+                    when (event) {
+                        is OpenCodeAgent.Event.Round -> _agentRounds.value = event.step
+                        is OpenCodeAgent.Event.Thinking -> _modelPreview.value = event.preview
+                        is OpenCodeAgent.Event.Note ->
+                            _agentMessages.update { it + AgentItem.Info(event.text) }
+                        is OpenCodeAgent.Event.AssistantText ->
+                            _agentMessages.update { it + AgentItem.Assistant(event.text) }
+                        is OpenCodeAgent.Event.ToolStart -> {
+                            _agentSteps.value = _agentSteps.value + 1
+                            _agentMessages.update { it + AgentItem.Tool(event.name, event.args, null) }
+                        }
+                        is OpenCodeAgent.Event.ToolDone ->
+                            _agentMessages.update { items ->
+                                val idx = items.indexOfLast { it is AgentItem.Tool && it.result == null && it.name == event.name }
+                                if (idx >= 0) items.toMutableList().also { list -> list[idx] = (list[idx] as AgentItem.Tool).copy(result = event.result) }
+                                else items + AgentItem.Tool(event.name, "", event.result)
+                            }
+                        is OpenCodeAgent.Event.Failed -> {
+                            _agentMessages.update { it + AgentItem.Error(event.message) }
+                            // Zen refuses keyless requests with 403 even for free
+                            // models — tell the user where the free key lives.
+                            if (config.isZen && "403" in event.message) {
+                                _agentMessages.update {
+                                    it + AgentItem.Info(
+                                        "Zen требует ключ даже для бесплатных моделей — получите его бесплатно на opencode.ai/auth " +
+                                            "(кнопка ⚙ над чатом). Бесплатные модели не расходуют кредиты.",
+                                    )
+                                }
                             }
                         }
                     }
                 }
-            }
 
-            // Persist the turn: history, todos, auto-title from the first
-            // message. Runs even after cancellation — memory is preserved.
-            session.messages = newHistory
-            session.info.model = config.model
-            if (session.info.title == "Новая сессия") {
-                val firstUser = firstUserText(newHistory) ?: userText
-                val auto = firstUser.replace('\n', ' ').trim().take(40).let { if (it.length == 40) it + "…" else it }
-                if (auto.isNotBlank()) session.info.title = auto
-            }
-            sessions.save(session)
-            _currentSession.value = session.info
-            refreshSessions()
-            persistAgentUi()
-            val secs = (System.currentTimeMillis() - turnStart) / 1000
-            if (_agentSteps.value > 0 || agentCancelled.get()) {
-                _agentMessages.update {
-                    it + AgentItem.Info("⏱ раундов: ${_agentSteps.value} · время: ${secs}с · сессия сохранена")
+                // Persist the turn: history, todos, auto-title from the first
+                // message. Runs even after cancellation — memory is preserved.
+                session.messages = newHistory
+                session.info.model = config.model
+                if (session.info.title == "Новая сессия") {
+                    val firstUser = firstUserText(newHistory) ?: userText
+                    val auto = firstUser.replace('\n', ' ').trim().take(40).let { if (it.length == 40) it + "…" else it }
+                    if (auto.isNotBlank()) session.info.title = auto
                 }
+                sessions.save(session)
+                _currentSession.value = session.info
+                refreshSessions()
+                persistAgentUi()
+                val secs = (System.currentTimeMillis() - turnStart) / 1000
+                if (_agentRounds.value > 0 || agentCancelled.get()) {
+                    _agentMessages.update {
+                        it + AgentItem.Info(
+                            "⏱ раундов: ${_agentRounds.value} · инструментов: ${_agentSteps.value} · " +
+                                "время: ${secs}с · сессия сохранена",
+                        )
+                    }
+                }
+            } catch (t: Throwable) {
+                // Anything unexpected must not leave the chat stuck on "working".
+                _agentMessages.update { it + AgentItem.Error(t.message ?: t.javaClass.simpleName) }
+            } finally {
+                _modelPreview.value = ""
+                _pendingQuestion.value = null
+                _pendingApproval.value = null
+                _agentRunning.value = false
             }
-            _agentRunning.value = false
         }
     }
 

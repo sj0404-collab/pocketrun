@@ -60,6 +60,15 @@ class AgentSettingsTest {
     }
 
     @Test
+    fun roundBudgetIsBigEnoughForRealWork() {
+        // A task that edits files, pushes them and waits for a CI run needs
+        // dozens of rounds; 12 stopped the agent halfway every time.
+        assertTrue(AgentSettings.DEFAULT_MAX_STEPS >= 20)
+        assertTrue(AgentSettings.MAX_STEPS_LIMIT >= 100)
+        assertTrue(AgentSettings.MAX_STEPS_LIMIT >= AgentSettings.DEFAULT_MAX_STEPS)
+    }
+
+    @Test
     fun modelsListParsingShape() {
         // GET /models of Zen returns OpenAI-style {"data":[{"id":...}]}
         val payload = JSONObject().put(

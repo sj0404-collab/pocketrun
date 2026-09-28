@@ -27,7 +27,9 @@ class OpenCodeTools(
         private const val MAX_READ = 32 * 1024
         private const val MAX_TOOL_OUTPUT = 16 * 1024
         private const val MAX_WEB = 24 * 1024
-        private const val BASH_TIMEOUT_MS = 120_000L
+
+        /** A single bash command may run this long — npm installs and builds need it. */
+        const val BASH_TIMEOUT_MS = 300_000L
     }
 
     private val shell = MiniShell(workspace, jsRuntime, npxRuntime)
@@ -44,6 +46,13 @@ class OpenCodeTools(
      */
     @Volatile
     var toolApprover: ((name: String, argsJson: String) -> Boolean)? = null
+
+    /**
+     * Polled by long-waiting tools (github run_wait) so that ⏹ actually stops
+     * a turn that is only waiting for a CI run.
+     */
+    @Volatile
+    var cancelCheck: (() -> Boolean)? = null
 
     /** Todo updates flow to the session and UI through this hook. */
     @Volatile
@@ -91,7 +100,7 @@ class OpenCodeTools(
                 "Supports quoting, && , | and > >> redirection. No git, no package managers other than npx.",
             JSONObject()
                 .put("command", str("command", "the shell command to run"))
-                .put("timeout", int("timeout", "optional timeout in milliseconds (max 120000)")),
+                .put("timeout", int("timeout", "optional timeout in milliseconds (max ${BASH_TIMEOUT_MS})")),
             listOf("command"),
         )
         tool(
@@ -210,10 +219,13 @@ class OpenCodeTools(
                 "Runners (runs-on: ubuntu-latest) are full Linux machines — there you can run npm packages, " +
                 "opencode itself (npm i -g opencode-ai; opencode run \"…\"), compilers, tests — the heavy work " +
                 "the mobile sandbox cannot do. Typical flow: repo_create → push (code + .github/workflows/run.yml " +
-                "with `on: workflow_dispatch`) → dispatch → poll runs → logs → artifacts. " +
+                "with `on: workflow_dispatch`, all files in ONE commit) → dispatch → run_wait (blocks until the run " +
+                "finishes and returns conclusion, jobs and the log tail) → artifacts/artifact_download. " +
+                "Never poll `runs` in a loop: run_wait does it in a single call. " +
                 "Ops: me; repo_list; repo_create{name,private,description?}; push{repo,files[{path,content}],message,branch?}; " +
-                "file_get{repo,path,ref?}; workflow_create{repo,filename,yaml}; dispatch{repo,workflow,ref?}; " +
-                "runs{repo,limit?}; logs{repo,run_id}; artifacts{repo,run_id?}; artifact_download{repo,artifact_id}; " +
+                "file_delete{repo,paths[],message,branch?}; file_get{repo,path,ref?}; workflow_create{repo,filename,yaml}; " +
+                "dispatch{repo,workflow,ref?}; runs{repo,limit?}; run_wait{repo,run_id?,timeout_sec?}; run_cancel{repo,run_id}; " +
+                "logs{repo,run_id}; artifacts{repo,run_id?}; artifact_download{repo,artifact_id}; " +
                 "api{method,path,body?} for anything else (PRs, issues, releases). " +
                 "Requires a GitHub token in the app settings (⚙ → GitHub, scopes repo+workflow).",
             JSONObject()
@@ -223,6 +235,7 @@ class OpenCodeTools(
                 .put("private", bool("private", "create a private repo (repo_create)"))
                 .put("description", str("description", "repo description (repo_create)"))
                 .put("files", arr("files", "files to push", JSONObject().put("type", "object").put("properties", JSONObject().put("path", str("path", "")).put("content", str("content", ""))).put("required", JSONArray(listOf("path", "content")))))
+                .put("paths", arr("paths", "paths to delete (file_delete)", str("path", "")))
                 .put("message", str("message", "commit message (push)"))
                 .put("branch", str("branch", "branch name (push/file_get)"))
                 .put("path", str("path", "file path (file_get)"))
@@ -230,8 +243,9 @@ class OpenCodeTools(
                 .put("filename", str("filename", "workflow file name, e.g. run.yml (workflow_create)"))
                 .put("yaml", str("yaml", "workflow YAML content (workflow_create)"))
                 .put("workflow", str("workflow", "workflow file name (dispatch)"))
-                .put("run_id", JSONObject().put("type", "integer").put("description", "run id (logs/artifacts)"))
+                .put("run_id", JSONObject().put("type", "integer").put("description", "run id (logs/artifacts/run_wait/run_cancel)"))
                 .put("artifact_id", JSONObject().put("type", "integer").put("description", "artifact id (artifact_download)"))
+                .put("timeout_sec", int("timeout_sec", "how long run_wait blocks, max ${GitHubClient.MAX_WAIT_SEC} (run_wait)"))
                 .put("limit", int("limit", "max runs to list"))
                 .put("method", str("method", "HTTP method (api)"))
                 .put("api_path", str("api_path", "REST path like /repos/o/n/pulls (api)"))
@@ -482,14 +496,32 @@ class OpenCodeTools(
                     gh.pushFiles(args.getString("repo"), files, args.optString("message", "update"), args.optString("branch").takeIf { it.isNotEmpty() })
                 }
                 "file_get" -> gh.fileGet(args.getString("repo"), args.getString("path"), args.optString("ref").takeIf { it.isNotEmpty() })
+                "file_delete" -> {
+                    val arr = args.optJSONArray("paths")
+                        ?: return "error: нужен массив paths[]"
+                    val paths = (0 until arr.length()).mapNotNull { arr.optString(it).takeIf { p -> p.isNotEmpty() } }
+                    if (paths.isEmpty()) return "error: paths пуст"
+                    gh.deleteFiles(
+                        args.getString("repo"), paths,
+                        args.optString("message", "remove files"),
+                        args.optString("branch").takeIf { it.isNotEmpty() },
+                    )
+                }
                 "workflow_create" -> gh.workflowCreate(args.getString("repo"), args.optString("filename", "run.yml"), args.getString("yaml"))
                 "dispatch" -> gh.dispatch(args.getString("repo"), args.getString("workflow"), args.optString("ref").takeIf { it.isNotEmpty() })
                 "runs" -> gh.runs(args.getString("repo"), args.optInt("limit", 10))
+                "run_wait" -> gh.runWait(
+                    repo = args.getString("repo"),
+                    runId = args.optLong("run_id", 0).takeIf { it != 0L },
+                    timeoutSec = args.optInt("timeout_sec", 600),
+                    isCancelled = { cancelCheck?.invoke() == true },
+                )
+                "run_cancel" -> gh.runCancel(args.getString("repo"), args.getLong("run_id"))
                 "logs" -> gh.logs(args.getString("repo"), args.getLong("run_id"))
                 "artifacts" -> gh.artifacts(args.getString("repo"), args.optLong("run_id", 0).takeIf { it != 0L })
                 "artifact_download" -> gh.artifactDownload(args.getString("repo"), args.getLong("artifact_id"))
                 "api" -> gh.api(args.optString("method", "GET"), args.getString("api_path"), args.optString("body").takeIf { it.isNotEmpty() })
-                else -> "error: неизвестная операция '$op' (me, repo_list, repo_create, push, file_get, workflow_create, dispatch, runs, logs, artifacts, artifact_download, api)"
+                else -> "error: неизвестная операция '$op' (me, repo_list, repo_create, push, file_delete, file_get, workflow_create, dispatch, runs, run_wait, run_cancel, logs, artifacts, artifact_download, api)"
             }
         } catch (e: GitHubClient.GitHubException) {
             "error: ${e.message}"

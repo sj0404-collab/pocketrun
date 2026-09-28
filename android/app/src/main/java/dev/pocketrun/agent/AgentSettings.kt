@@ -30,8 +30,14 @@ object AgentSettings {
     val MODES = listOf(MODE_AUTO, MODE_MANUAL, MODE_ASK)
     val MODE_LABELS = mapOf(MODE_AUTO to "Авто", MODE_MANUAL to "Вручную", MODE_ASK to "Вопросы")
 
-    const val DEFAULT_MAX_STEPS = 12
-    const val MAX_STEPS_LIMIT = 60
+    /**
+     * Model rounds per user request. Each round is one model call plus the
+     * tools it asked for, so a real task (edit a project, push it, wait for the
+     * CI run, fix what broke) needs dozens of them — the old default of 12
+     * stopped agents in the middle of ordinary work.
+     */
+    const val DEFAULT_MAX_STEPS = 40
+    const val MAX_STEPS_LIMIT = 500
 
     /** Ready-made presets shown in the model settings dialog. */
     data class Preset(val label: String, val baseUrl: String, val model: String)

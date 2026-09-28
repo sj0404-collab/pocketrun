@@ -82,15 +82,50 @@ class OpenCodeToolsGateTest {
         assertFalse(tools.isReadOnly("apply_patch", JSONObject()))
 
         assertTrue(tools.isReadOnly("github", JSONObject().put("op", "runs")))
+        assertTrue(tools.isReadOnly("github", JSONObject().put("op", "run_wait")))
         assertTrue(tools.isReadOnly("github", JSONObject().put("op", "logs")))
         assertTrue(tools.isReadOnly("github", JSONObject().put("op", "artifacts")))
         assertTrue(tools.isReadOnly("github", JSONObject().put("op", "repo_list")))
         assertTrue(tools.isReadOnly("github", JSONObject().put("op", "file_get")))
         assertTrue(tools.isReadOnly("github", JSONObject().put("op", "me")))
         assertFalse(tools.isReadOnly("github", JSONObject().put("op", "push")))
+        assertFalse(tools.isReadOnly("github", JSONObject().put("op", "file_delete")))
         assertFalse(tools.isReadOnly("github", JSONObject().put("op", "repo_create")))
         assertFalse(tools.isReadOnly("github", JSONObject().put("op", "dispatch")))
+        assertFalse(tools.isReadOnly("github", JSONObject().put("op", "run_cancel")))
         assertFalse(tools.isReadOnly("github", JSONObject().put("op", "api")))
+    }
+
+    @Test
+    fun githubUnknownOpListsTheWaitingAndCommitOps() {
+        val h = newTools(githubToken = "faketoken")
+        val r = h.tools.execute("github", """{"op":"nonsense"}""")
+        assertTrue(r.contains("неизвестная операция"))
+        assertTrue(r.contains("repo_create"))
+        assertTrue(r.contains("run_wait"))
+        assertTrue(r.contains("file_delete"))
+        assertTrue(r.contains("artifact_download"))
+    }
+
+    @Test
+    fun toolDefinitionsCoverTheNewGithubOps() {
+        val tools = newTools().tools
+        val defs = tools.definitions().toString()
+        assertTrue(defs.contains("run_wait"))
+        assertTrue(defs.contains("run_cancel"))
+        assertTrue(defs.contains("file_delete"))
+        assertTrue(defs.contains("timeout_sec"))
+        // The description must tell the model not to poll.
+        assertTrue(defs.contains("run_wait"))
+        assertTrue(defs.contains("ONE commit"))
+    }
+
+    @Test
+    fun bashTimeoutIsGenerousEnoughForInstalls() {
+        assertTrue(OpenCodeTools.BASH_TIMEOUT_MS >= 300_000L)
+        val h = newTools()
+        val r = h.tools.execute("bash", """{"command":"echo ok","timeout":999999}""")
+        assertTrue(r.contains("ok"))
     }
 
     @Test
@@ -100,15 +135,6 @@ class OpenCodeToolsGateTest {
         val r = h.tools.execute("github", """{"op":"repo_list"}""")
         assertTrue(r.contains("GitHub-токен не задан"))
         assertTrue(r.contains("⚙"))
-    }
-
-    @Test
-    fun githubUnknownOpListsValidOnes() {
-        val h = newTools(githubToken = "faketoken")
-        val r = h.tools.execute("github", """{"op":"nonsense"}""")
-        assertTrue(r.contains("неизвестная операция"))
-        assertTrue(r.contains("repo_create"))
-        assertTrue(r.contains("artifact_download"))
     }
 
     @Test
