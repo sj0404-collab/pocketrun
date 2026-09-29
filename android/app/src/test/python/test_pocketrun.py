@@ -5,6 +5,7 @@ with `python3 -m unittest` (see .github/workflows/android.yml).
 """
 
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -170,6 +171,31 @@ class RunTest(unittest.TestCase):
         self.assertIn('["1", "2"]', self.tail(self.out))
 
     def test_a_script_reading_outside_fails_with_a_traceback(self):
+        self.assertEqual(self.call("open('/etc/passwd').read()"), 1)
+        self.assertIn("SandboxViolation", self.tail(self.err))
+
+    def test_a_run_leaves_sys_path_as_it_found_it(self):
+        # The interpreter is shared by every run, so a script folder that stays
+        # behind is a path the next run (and every later import) has to walk.
+        before = list(sys.path)
+        self.assertEqual(self.call("print('hi')"), 0)
+        self.assertEqual(sys.path, before)
+
+    def test_a_violation_is_reported_after_an_earlier_run_left_a_dead_path(self):
+        # Formatting a traceback lazily imports the stdlib, and the import
+        # machinery walks sys.path: a workspace of an earlier run that is gone
+        # by now used to turn the report into a second, bogus violation.
+        gone = tempfile.mkdtemp()
+        proj = os.path.join(gone, "proj")
+        os.makedirs(proj)
+        script = os.path.join(proj, "s.py")
+        with open(script, "w") as handle:
+            handle.write("pass\n")
+        out = os.path.join(gone, "out.log")
+        err = os.path.join(gone, "err.log")
+        self.assertEqual(pocketrun.run(script, "[]", None, out, err, proj, gone), 0)
+        shutil.rmtree(gone)
+        sys.modules.pop("unicodedata", None)  # what the traceback module does on its own
         self.assertEqual(self.call("open('/etc/passwd').read()"), 1)
         self.assertIn("SandboxViolation", self.tail(self.err))
 

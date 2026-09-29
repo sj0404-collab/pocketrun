@@ -100,6 +100,7 @@ def run(script, args_json, stdin_text, out_path, err_path, cwd, sandbox_root=Non
         sys.stdin,
         sys.argv,
         os.getcwd(),
+        list(sys.path),
     )
     if cwd:
         try:
@@ -120,6 +121,7 @@ def run(script, args_json, stdin_text, out_path, err_path, cwd, sandbox_root=Non
     err = PipeStream(err_path, previous[1])
     sys.stdout, sys.stderr = out, err
     code = 0
+    failure = None
     try:
         with pocketrun_sandbox.intercept(
             read_roots=_read_roots(sandbox_root or cwd),
@@ -134,13 +136,19 @@ def run(script, args_json, stdin_text, out_path, err_path, cwd, sandbox_root=Non
                 _write_line(err_path, "KeyboardInterrupt")
                 code = 130
             except BaseException:
-                # SandboxViolation lands here too: the traceback is the report.
-                traceback.print_exc(file=err)
+                # SandboxViolation lands here too: the traceback is the report,
+                # and it is written once the jail is off.
+                failure = sys.exc_info()
                 code = 1
+        if failure is not None:
+            _report(failure, err)
     finally:
         # Restoring global state happens outside the jail: the previous working
         # directory is the app's own, and the jail would refuse to go back to it.
         sys.stdout, sys.stderr, sys.stdin, sys.argv = previous[:4]
+        # sys.path too: a script folder left behind outlives its workspace, and
+        # the next run would walk a path that is not there anymore.
+        sys.path[:] = previous[5]
         out.close()
         err.close()
         try:
@@ -148,6 +156,19 @@ def run(script, args_json, stdin_text, out_path, err_path, cwd, sandbox_root=Non
         except OSError:
             pass
     return code
+
+
+def _report(failure, err):
+    """Writes the traceback of [failure] to [err] without ever raising.
+
+    Formatting a traceback reads source files and lazily imports the standard
+    library, which is why it runs with the jail off: reporting a violation must
+    not be the thing that trips the jail a second time.
+    """
+    try:
+        traceback.print_exception(failure[0], failure[1], failure[2], file=err)
+    except Exception as exc:  # a broken report is still not a broken run
+        err.write("%s: %s\n" % (failure[0].__name__, exc))
 
 
 def _read_roots(sandbox_root):
