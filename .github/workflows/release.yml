@@ -1,0 +1,131 @@
+name: Release
+
+# A tag is the release: v1.5.0 builds the APKs, runs the same tests as the
+# Android workflow, and publishes them as a GitHub release. The app reads
+# /releases/latest to find out what is new, so publishing here is what makes an
+# update show up on a phone.
+#
+# The APKs are named PocketRun-<tag>-release.apk / -debug.apk, which is what
+# dev.pocketrun.update.AppUpdate looks for.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to publish (e.g. v1.5.0); empty = the pushed tag"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build and publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+          # versionCode/versionName come from the nearest tag, and a checkout of
+          # a ref does not fetch tags even at depth 0.
+          fetch-tags: true
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # Chaquopy needs a build machine Python matching the app's major.minor.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Cache Chaquopy downloads
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.chaquopy
+            ~/.gradle/caches/modules-2
+          key: chaquopy-${{ hashFiles('android/app/build.gradle.kts') }}
+          restore-keys: chaquopy-
+
+      - name: Unit tests
+        working-directory: android
+        run: ./gradlew --no-daemon :app:testDebugUnitTest
+
+      - name: Python sandbox tests
+        run: python3 -m unittest discover -s android/app/src/test/python -v
+
+      - name: Assemble release APK
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          KEYSTORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        # No working-directory here on purpose: the keystore lands in android/
+        # (the Gradle rootProject) and gradlew is invoked from android/.
+        run: |
+          set -euo pipefail
+          if [ -z "${KEYSTORE_B64:-}" ]; then
+            echo "::error title=no signing key::ANDROID_KEYSTORE_B64 is not configured; a release without a signature is not an update."
+            exit 1
+          fi
+          printf '%s' "$KEYSTORE_B64" | base64 -d > android/keystore.jks
+          cat > android/keystore.properties <<EOF
+          storeFile=keystore.jks
+          storePassword=$KEYSTORE_PASS
+          keyAlias=$KEY_ALIAS
+          keyPassword=$KEY_PASS
+          EOF
+          cd android && ./gradlew --no-daemon :app:assembleRelease :app:assembleDebug
+
+      - name: Name the assets
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp android/app/build/outputs/apk/release/*.apk "dist/PocketRun-${TAG}-release.apk"
+          cp android/app/build/outputs/apk/debug/*.apk "dist/PocketRun-${TAG}-debug.apk"
+          ls -la dist
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          NOTES=$(cat <<'EOF'
+          Ключ активации в этот раз не нужен: сборка активируется общим ключом,
+          который лежит внутри APK (android/shared-license.key). Он открыт по
+          определению — тот, у кого есть файл, может его прочитать, — так что
+          лицензия здесь формальность, а не защита.
+
+          Обновления приходят сами: приложение раз в сутки спрашивает GitHub про
+          последний релиз и предлагает установить его (вкладка «Инфо» → «Обновления»).
+          EOF
+          )
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "releasing $TAG (replacing the assets of an existing release)"
+            gh release upload "$TAG" dist/*.apk --clobber
+          else
+            gh release create "$TAG" dist/*.apk \
+              --title "PocketRun $TAG" \
+              --notes "$NOTES" \
+              --generate-notes
+          fi
+
+      - name: Build report
+        run: |
+          echo "### PocketRun $TAG" >> "$GITHUB_STEP_SUMMARY"
+          ls -la dist >> "$GITHUB_STEP_SUMMARY"

@@ -1,5 +1,6 @@
 package dev.pocketrun.ui
 
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
@@ -7,6 +8,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
@@ -15,15 +17,18 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import dev.pocketrun.BuildConfig
 import dev.pocketrun.license.LicenseManager
 
-/** License details, runtime status and build info. */
+/** License details, runtime status, updates and build info. */
 @Composable
 fun InfoScreen(viewModel: AppViewModel, license: LicenseManager.LicenseState.Active) {
+    val update by viewModel.updateState.collectAsState()
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -37,8 +42,10 @@ fun InfoScreen(viewModel: AppViewModel, license: LicenseManager.LicenseState.Act
             InfoRow("План", license.claims.plan)
             val days = license.daysRemaining
             InfoRow("Срок", if (days == null) "бессрочная" else "истекает через $days дн.")
-            InfoRow("Отпечаток ключа", license.fingerprint)
+            InfoRow("Ключ", if (license.isShared) "общий (в сборке)" else license.fingerprint)
         }
+
+        UpdateCard(update, viewModel)
 
         SectionCard("Рантайм") {
             InfoRow("CPython", viewModel.runtimeVersion() ?: "запускается…")
@@ -67,18 +74,122 @@ fun InfoScreen(viewModel: AppViewModel, license: LicenseManager.LicenseState.Act
         }
 
         Spacer(Modifier.height(4.dp))
-        Button(
-            onClick = viewModel::forgetLicense,
-            modifier = Modifier.fillMaxWidth(),
-        ) {
-            Text("Деактивировать лицензию")
+        if (!license.isShared) {
+            Button(
+                onClick = viewModel::forgetLicense,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text("Деактивировать лицензию")
+            }
+            Text(
+                "После деактивации ключ нужно ввести заново; данные проектов сохранятся.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
         }
-        Text(
-            "После деактивации ключ нужно ввести заново; данные проектов сохранятся.",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
     }
+}
+
+@Composable
+private fun UpdateCard(state: AppViewModel.UpdateState, viewModel: AppViewModel) {
+    SectionCard("Обновления") {
+        InfoRow("Установлено", viewModel.installedVersion())
+        when (state) {
+            is AppViewModel.UpdateState.Idle ->
+                Text(
+                    "Приложение проверяет GitHub-релиз раз в сутки и предлагает обновление.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+
+            is AppViewModel.UpdateState.Checking ->
+                Text("Проверяю…", style = MaterialTheme.typography.bodyMedium)
+
+            is AppViewModel.UpdateState.UpToDate ->
+                Text(
+                    "Установлена последняя версия.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+
+            is AppViewModel.UpdateState.Available -> {
+                Text(
+                    "Доступна ${state.release.version} (${state.release.tag}), " +
+                        "${humanSize(state.release.asset.size)}",
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+                if (BuildConfig.DEBUG) {
+                    Text(
+                        "Это debug-сборка: она ставится рядом с обычной, отдельным приложением.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                if (state.release.notes.isNotEmpty()) {
+                    Text(
+                        state.release.notes.take(400),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(onClick = viewModel::downloadUpdate) { Text("Скачать") }
+                    Text(
+                        "Позже",
+                        modifier = Modifier
+                            .clickable { viewModel.dismissUpdate() }
+                            .padding(12.dp),
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                }
+            }
+
+            is AppViewModel.UpdateState.Downloading -> {
+                val total = state.total
+                val percent = if (total > 0) "${state.done * 100 / total}%" else "${humanSize(state.done)}"
+                Text("Скачиваю… $percent", style = MaterialTheme.typography.bodyMedium)
+            }
+
+            is AppViewModel.UpdateState.Ready -> {
+                Text(
+                    "APK скачан (${humanSize(state.file.length())}). Установку подтверждает система.",
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(onClick = viewModel::installUpdate) { Text("Установить") }
+                    Text(
+                        "Позже",
+                        modifier = Modifier
+                            .clickable { viewModel.dismissUpdate() }
+                            .padding(12.dp),
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                }
+            }
+
+            is AppViewModel.UpdateState.Failed ->
+                Text(
+                    state.message,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.error,
+                )
+        }
+        if (state !is AppViewModel.UpdateState.Checking && state !is AppViewModel.UpdateState.Downloading) {
+            Text(
+                "Проверить сейчас",
+                modifier = Modifier
+                    .clickable { viewModel.checkForUpdate() }
+                    .padding(vertical = 8.dp),
+                color = MaterialTheme.colorScheme.primary,
+            )
+        }
+    }
+}
+
+private fun humanSize(bytes: Long): String = when {
+    bytes <= 0L -> "размер неизвестен"
+    bytes < 1024L * 1024 -> "${bytes / 1024} КБ"
+    else -> String.format(java.util.Locale.US, "%.1f МБ", bytes / (1024.0 * 1024.0))
 }
 
 @Composable

@@ -1,6 +1,9 @@
 package dev.pocketrun.ui
 
 import android.app.Application
+import android.content.Context
+import android.content.Intent
+import androidx.core.content.FileProvider
 import androidx.lifecycle.AndroidViewModel
 import dev.pocketrun.BuildConfig
 import dev.pocketrun.agent.AgentSettings
@@ -18,6 +21,9 @@ import dev.pocketrun.runtime.RuntimeKind
 import dev.pocketrun.runtime.js.JsRuntime
 import dev.pocketrun.runtime.npm.NpxRuntime
 import dev.pocketrun.runtime.python.PythonRuntime
+import dev.pocketrun.update.AppUpdate
+import dev.pocketrun.update.AppUpdater
+import dev.pocketrun.update.ReleaseInfo
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -38,7 +44,8 @@ import java.util.concurrent.atomic.AtomicBoolean
  */
 class AppViewModel(app: Application) : AndroidViewModel(app) {
 
-    private val licenseManager = LicenseManager(app, BuildConfig.LICENSE_PUBKEY)
+    private val licenseManager =
+        LicenseManager(app, BuildConfig.LICENSE_PUBKEY, BuildConfig.SHARED_LICENSE_KEY)
     val licenseState: StateFlow<LicenseManager.LicenseState> = licenseManager.state
 
     private val workspace = Workspace.from(app)
@@ -663,6 +670,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         refreshProjects()
         if (_projects.value.isEmpty()) createProject("hello")
         restoreAgentUi()
+        checkUpdateInBackground()
     }
 
     /**
@@ -844,8 +852,114 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     fun forgetLicense() = licenseManager.forget()
 
+    // ------------------------------------------------------------- updates
+
+    /** What the updater is doing, as one screen of state. */
+    sealed interface UpdateState {
+        data object Idle : UpdateState
+        data object Checking : UpdateState
+        data class Available(val release: ReleaseInfo) : UpdateState
+        data object UpToDate : UpdateState
+        data class Downloading(val release: ReleaseInfo, val done: Long, val total: Long) : UpdateState
+        data class Ready(val release: ReleaseInfo, val file: File) : UpdateState
+        data class Failed(val message: String) : UpdateState
+    }
+
+    private val _updateState = MutableStateFlow<UpdateState>(UpdateState.Idle)
+    val updateState: StateFlow<UpdateState> = _updateState.asStateFlow()
+
+    private val updateChecked = AtomicBoolean(false)
+
+    /**
+     * Asks GitHub whether a newer release exists. A build that is already the
+     * newest reports [UpdateState.UpToDate] and nothing else - no nagging, no
+     * download behind the user's back.
+     */
+    fun checkForUpdate() {
+        if (_updateState.value is UpdateState.Checking) return
+        if (_updateState.value is UpdateState.Downloading) return
+        _updateState.value = UpdateState.Checking
+        ioExecutor.execute {
+            try {
+                val release = updater().latest()
+                val newer = AppUpdate.isNewer(release.version, installedVersion())
+                _updateState.value = if (newer) {
+                    UpdateState.Available(release)
+                } else {
+                    UpdateState.UpToDate
+                }
+            } catch (t: Throwable) {
+                _updateState.value = UpdateState.Failed(t.message ?: "проверка не удалась")
+            }
+        }
+    }
+
+    /**
+     * Downloads the APK of the release found by [checkForUpdate]. Nothing is
+     * installed from here: the file is handed to the system installer, which
+     * asks the user.
+     */
+    fun downloadUpdate() {
+        val release = (_updateState.value as? UpdateState.Available)?.release ?: return
+        _updateState.value = UpdateState.Downloading(release, 0, release.asset.size)
+        ioExecutor.execute {
+            try {
+                val file = updater().download(release.asset.url, File(updateDir(), release.asset.name)) { done, total ->
+                    _updateState.value = UpdateState.Downloading(release, done, total)
+                }
+                _updateState.value = UpdateState.Ready(release, file)
+            } catch (t: Throwable) {
+                _updateState.value = UpdateState.Failed(t.message ?: "загрузка не удалась")
+            }
+        }
+    }
+
+    /** Opens the system installer for a downloaded APK. */
+    fun installUpdate() {
+        val file = (_updateState.value as? UpdateState.Ready)?.file ?: return
+        val context = getApplication<Application>()
+        try {
+            val uri = FileProvider.getUriForFile(context, "${context.packageName}.updates", file)
+            val intent = Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(uri, "application/vnd.android.package-archive")
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            context.startActivity(intent)
+        } catch (t: Throwable) {
+            _updateState.value = UpdateState.Failed(t.message ?: "установщик не открылся")
+        }
+    }
+
+    fun dismissUpdate() {
+        _updateState.value = UpdateState.Idle
+    }
+
+    /** The version this build reports, without the debug suffix Gradle adds. */
+    fun installedVersion(): String = AppUpdate.version(BuildConfig.VERSION_NAME ?: "")
+
+    private fun updater() =
+        AppUpdater(BuildConfig.UPDATE_REPO, AgentSettings.read(getApplication()).githubToken)
+
+    private fun updateDir(): File = File(getApplication<Application>().cacheDir, "updates")
+
+    /**
+     * One quiet check a day, on launch, and only once the app is licensed:
+     * nobody should wait on a network call to reach the projects list.
+     */
+    private fun checkUpdateInBackground() {
+        if (updateChecked.getAndSet(true)) return
+        if (licenseState.value !is LicenseManager.LicenseState.Active) return
+        val prefs = getApplication<Application>().getSharedPreferences("updates", Context.MODE_PRIVATE)
+        val last = prefs.getLong("lastCheck", 0L)
+        val now = System.currentTimeMillis()
+        if (now - last < CHECK_INTERVAL_MS) return
+        prefs.edit().putLong("lastCheck", now).apply()
+        checkForUpdate()
+    }
+
     companion object {
         private const val MAX_OUTPUT_LINES = 2_000
+        private const val CHECK_INTERVAL_MS = 24L * 60 * 60 * 1000
 
         val DEFAULT_SCRIPT = """
             import sys

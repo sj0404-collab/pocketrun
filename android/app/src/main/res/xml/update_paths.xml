@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Only the update directory inside the app cache is shareable: the installer
+     gets a read grant for one downloaded APK and nothing else. -->
+<paths>
+    <cache-path
+        name="updates"
+        path="updates/" />
+</paths>

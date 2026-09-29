@@ -69,6 +69,8 @@ android {
         versionName = runGit("describe", "--tags", "--abbrev=0")?.removePrefix("v") ?: "1.0.0"
         ndk { abiFilters += listOf("arm64-v8a", "x86_64") }
         buildConfigField("String", "LICENSE_PUBKEY", "\"${licensePublicKey()}\"")
+        buildConfigField("String", "SHARED_LICENSE_KEY", "\"${sharedLicenseKey()}\"")
+        buildConfigField("String", "UPDATE_REPO", "\"${updateRepo()}\"")
     }
 
     signingConfigs {
@@ -167,6 +169,32 @@ fun licensePublicKey(): String {
     val file = rootProject.file("license.pubkey")
     if (file.isFile) return file.readText().trim()
     return "DEMO00000000000000000000000000000000000000000000000000000000000000"
+}
+
+/**
+ * The key every build carries in it: the app activates itself with this one, so
+ * a published release is usable by anyone without pasting anything. It is public
+ * by design - whoever holds the APK can read it - so the license gate is a
+ * formality here, not a protection.
+ *
+ * The file is written by tools/keygen (see docs/PLAN.md §2.3); keep it in sync
+ * with license.pubkey, or the app falls back to the activation screen.
+ */
+fun sharedLicenseKey(): String {
+    val override = (project.findProperty("sharedLicenseKey") as String?)?.trim()
+    if (!override.isNullOrEmpty()) return override
+    val file = rootProject.file("shared-license.key")
+    if (!file.isFile) return ""
+    val key = file.readText().trim()
+    require('"' !in key && '\\' !in key) { "shared-license.key is not a plain PRK1 key" }
+    return key
+}
+
+/** Where the in-app updater looks for releases: owner/name of the GitHub repository. */
+fun updateRepo(): String {
+    val override = (project.findProperty("updateRepo") as String?)?.trim()
+    if (!override.isNullOrEmpty()) return override
+    return "sj0404-collab/pocketrun"
 }
 
 dependencies {
