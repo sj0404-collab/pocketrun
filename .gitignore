@@ -13,3 +13,5 @@ captures/
 .externalNativeBuild/
 .cxx/
 .DS_Store
+__pycache__/
+*.pyc

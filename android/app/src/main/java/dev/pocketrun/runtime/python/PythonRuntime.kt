@@ -36,7 +36,7 @@ object PythonRuntime {
 
     @Volatile private var python: Python? = null
     @Volatile private var version: String? = null
-    @Volatile private var runsDir: File? = null
+    @Volatile private var workspace: Workspace? = null
 
     private val executor: ExecutorService = Executors.newSingleThreadExecutor { runnable ->
         Thread(runnable, "pocketrun-python-run").apply { isDaemon = true }
@@ -52,7 +52,7 @@ object PythonRuntime {
                         val appContext = context.applicationContext
                         Python.start(AndroidPlatform(appContext))
                         val py = Python.getInstance()
-                        runsDir = File(Workspace.from(appContext).cache, "runs").apply { mkdirs() }
+                        workspace = Workspace.from(appContext)
                         version = readVersion(py)
                         python = py
                         Log.i(TAG, "Python started ($version)")
@@ -83,6 +83,11 @@ object PythonRuntime {
      * tailer threads; [listener.onFinished] / [listener.onFailed] arrive from
      * the single run thread.
      *
+     * The target and the working directory are resolved through
+     * [Workspace.resolve] first, so a script can only ever be one of the files
+     * inside the sandbox; the Python side repeats the check with an audit-hook
+     * jail for everything the script does itself.
+     *
      * Cancellation is cooperative: Chaquopy cannot interrupt a call, so
      * [ExecutionHandle.cancel] only raises a flag, and the result is reported
      * with exit code 130 (SIGINT) once the script returns on its own.
@@ -98,9 +103,22 @@ object PythonRuntime {
             return Handle(running, cancelled)
         }
 
+        val sandbox = workspace
+        if (sandbox == null) {
+            running.set(false)
+            listener.onFailed(IllegalStateException("Python is not running (yet)"))
+            return Handle(running, cancelled)
+        }
+        val cwd = request.cwd?.let { sandbox.resolve(it.absolutePath) } ?: sandbox.root
+        val target = sandbox.resolve(request.target, cwd)
+        if (target == null) {
+            running.set(false)
+            listener.onFailed(IllegalArgumentException("путь вне рабочей папки отклонён: ${request.target}"))
+            return Handle(running, cancelled)
+        }
+
         val startedAt = System.currentTimeMillis()
-        val runDir = File(runsDir ?: File(request.cwd, ".runs"), UUID.randomUUID().toString())
-            .apply { mkdirs() }
+        val runDir = File(sandbox.cache, "runs/${UUID.randomUUID()}").apply { mkdirs() }
         val outFile = File(runDir, "out.log")
         val errFile = File(runDir, "err.log")
         val stdout = Capture()
@@ -116,12 +134,13 @@ object PythonRuntime {
                 val argsJson = org.json.JSONArray().apply { request.args.forEach { put(it) } }.toString()
                 val exitCode = py.getModule("pocketrun").callAttr(
                     "run",
-                    request.target,
+                    target.absolutePath,
                     argsJson,
                     request.stdin,
                     outFile.absolutePath,
                     errFile.absolutePath,
-                    request.cwd?.absolutePath,
+                    cwd.absolutePath,
+                    sandbox.root.absolutePath,
                 ).toInt()
 
                 stopped.set(true)

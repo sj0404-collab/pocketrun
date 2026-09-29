@@ -51,6 +51,10 @@ jobs:
         working-directory: android
         run: ./gradlew --no-daemon :app:testDebugUnitTest
 
+      # The Python jail is plain CPython, so it is tested without an emulator.
+      - name: Python sandbox tests
+        run: python3 -m unittest discover -s android/app/src/test/python -v
+
       - name: Assemble debug APK
         working-directory: android
         run: ./gradlew --no-daemon :app:assembleDebug

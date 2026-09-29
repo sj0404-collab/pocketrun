@@ -10,11 +10,14 @@ import kotlinx.coroutines.flow.asStateFlow
  * Holds the activated key and exposes it as observable state. The key is
  * re-verified on every launch and whenever the user pastes a new one; nothing is
  * cached as "already validated".
+ *
+ * Verification uses [MonotonicClock], so turning the device clock back cannot
+ * bring an expired key back to life.
  */
 class LicenseManager(
     context: Context,
     private val publicKey: String,
-    private val now: () -> Long = { System.currentTimeMillis() / 1000 },
+    private val clock: MonotonicClock = MonotonicClock.forContext(context),
 ) {
     private val prefs: SharedPreferences =
         context.applicationContext.getSharedPreferences("license", Context.MODE_PRIVATE)
@@ -42,13 +45,13 @@ class LicenseManager(
             _state.value = LicenseState.Rejected("Enter a license key.")
             return false
         }
-        return when (val outcome = LicenseVerifier.verify(key, publicKey, now())) {
+        return when (val outcome = LicenseVerifier.verify(key, publicKey, clock.now())) {
             is LicenseVerifier.Outcome.Valid -> {
                 prefs.edit().putString(KEY, key).apply()
                 _state.value = LicenseState.Active(
                     claims = outcome.claims,
                     fingerprint = outcome.keyFingerprint,
-                    daysRemaining = LicenseVerifier.daysRemaining(outcome.claims, now()),
+                    daysRemaining = LicenseVerifier.daysRemaining(outcome.claims, clock.now()),
                 )
                 true
             }
@@ -78,11 +81,11 @@ class LicenseManager(
     private fun evaluate(): LicenseState {
         val stored = prefs.getString(KEY, null)
         if (stored.isNullOrBlank()) return LicenseState.NeedsActivation
-        return when (val outcome = LicenseVerifier.verify(stored, publicKey, now())) {
+        return when (val outcome = LicenseVerifier.verify(stored, publicKey, clock.now())) {
             is LicenseVerifier.Outcome.Valid -> LicenseState.Active(
                 claims = outcome.claims,
                 fingerprint = outcome.keyFingerprint,
-                daysRemaining = LicenseVerifier.daysRemaining(outcome.claims, now()),
+                daysRemaining = LicenseVerifier.daysRemaining(outcome.claims, clock.now()),
             )
 
             is LicenseVerifier.Outcome.Expired ->

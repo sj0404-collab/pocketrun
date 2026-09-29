@@ -3,14 +3,23 @@ package dev.pocketrun.runtime.npm
 import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
+import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
+import java.security.MessageDigest
+import java.util.Base64
 
 /**
  * The slice of the npm registry HTTP API the app needs: package metadata and
  * tarball downloads. Works against registry.npmjs.org; the same endpoints are
  * served by any npm mirror (GPR, Verdaccio, …) by changing [baseUrl].
+ *
+ * A registry is a code source: whoever answers it chooses the JavaScript the
+ * app evaluates. Two things are therefore checked on every tarball — the digest
+ * the metadata promised, and that the download really comes from the registry
+ * the metadata came from. Metadata without a digest is refused, exactly like
+ * npm does.
  */
 class NpmRegistry(private val baseUrl: String = "https://registry.npmjs.org/") {
 
@@ -29,9 +38,92 @@ class NpmRegistry(private val baseUrl: String = "https://registry.npmjs.org/") {
         }
     }
 
-    /** Downloads the tarball at [url] (a `dist.tarball` value) into [dest]. */
-    fun downloadTarball(url: String, dest: File) {
+    /**
+     * Downloads the tarball at [url] into [dest] and proves it is the one the
+     * metadata described.
+     *
+     * @param integrity the `dist.integrity` value (`sha512-<base64>`, possibly
+     *   several space-separated digests). Required: a packument without it
+     *   cannot be trusted to be the real package.
+     */
+    fun downloadTarball(url: String, dest: File, integrity: String?) {
+        requireTrusted(url)
+        val expected = requireIntegrity(integrity, url)
         http(url, dest)
+        val actual = digestOf(dest, expected.algorithm)
+        if (actual != expected.b64) {
+            // Never leave a tarball that failed its check on disk: the caller
+            // would happily extract it.
+            dest.delete()
+            val detail = expected.algorithms.joinToString(", ")
+            throw RegistryException(
+                "несовпадение контрольной суммы tarball (ожидалась $detail, получено " +
+                    "${actual.take(12)}…) — пакет отклонён",
+            )
+        }
+    }
+
+    // ------------------------------------------------------------- digests
+
+    /** One expected digest: the algorithm and the base64 it must equal. */
+    private data class Expected(val algorithm: String, val b64: String, val algorithms: List<String>)
+
+    private fun requireIntegrity(integrity: String?, url: String): Expected {
+        val digests = integrity?.split(' ', '\t')?.map { it.trim() }?.filter { it.isNotEmpty() }.orEmpty()
+        val parsed = digests.mapNotNull { parseDigest(it) }
+        if (parsed.isEmpty()) {
+            throw RegistryException(
+                "в метаданных нет integrity для ${url.take(120)} — пакет без контрольной суммы не ставится",
+            )
+        }
+        // The strongest digest is the one that is checked; npm does the same.
+        val strongest = parsed.maxBy { it.first.length }
+        return Expected(strongest.first, strongest.second, parsed.map { it.first }.distinct())
+    }
+
+    private fun parseDigest(value: String): Pair<String, String>? {
+        val dash = value.indexOf('-')
+        if (dash <= 0) return null
+        val algorithm = value.substring(0, dash).lowercase()
+        if (algorithm !in SUPPORTED) return null
+        val b64 = value.substring(dash + 1)
+        return runCatching { Base64.getDecoder().decode(b64) }.map { algorithm to b64 }.getOrNull()
+    }
+
+    private fun digestOf(file: File, algorithm: String): String {
+        val digest = MessageDigest.getInstance(algorithm)
+        file.inputStream().use { input ->
+            val buf = ByteArray(64 * 1024)
+            while (true) {
+                val n = input.read(buf)
+                if (n < 0) break
+                digest.update(buf, 0, n)
+            }
+        }
+        return Base64.getEncoder().encodeToString(digest.digest())
+    }
+
+    /**
+     * A tarball must be https and must live on the registry the metadata came
+     * from — otherwise a compromised packument can point the app at an
+     * arbitrary host and the integrity check would only prove that *that* host
+     * serves what it said.
+     */
+    private fun requireTrusted(url: String) {
+        val parsed = runCatching { URL(url) }.getOrElse {
+            throw RegistryException("некорректный tarball URL: ${url.take(120)}")
+        }
+        if (parsed.protocol != "https") {
+            throw RegistryException("tarball должен скачиваться по https, а не ${parsed.protocol}")
+        }
+        val registry = runCatching { URL(baseUrl).host }.getOrElse { "" }
+        val host = parsed.host.lowercase()
+        val allowed = registry.lowercase()
+        if (allowed.isNotEmpty() && host != allowed && !host.endsWith(".$allowed")) {
+            throw RegistryException(
+                "tarball лежит на $host, а метаданные пришли с $allowed — пакет отклонён",
+            )
+        }
     }
 
     // ---------------------------------------------------------------- http
@@ -54,7 +146,10 @@ class NpmRegistry(private val baseUrl: String = "https://registry.npmjs.org/") {
             val text = streamText(conn, status)
             throw RegistryException("HTTP $status для ${url.take(120)}: ${text.take(200)}")
         }
-        val input = conn.inputStream
+        copy(conn.inputStream, dest)
+    }
+
+    private fun copy(input: InputStream, dest: File) {
         FileOutputStream(dest).use { out ->
             val buf = ByteArray(64 * 1024)
             while (true) {
@@ -87,5 +182,9 @@ class NpmRegistry(private val baseUrl: String = "https://registry.npmjs.org/") {
         } else {
             stream.bufferedReader(Charsets.UTF_8).use { it.readText().take(8_192) }
         }
+    }
+
+    companion object {
+        private val SUPPORTED = setOf("sha512", "sha384", "sha256", "sha1")
     }
 }

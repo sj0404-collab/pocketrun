@@ -231,7 +231,7 @@ class NpxRuntime(
         if (tarball.isNullOrEmpty()) throw IllegalStateException("у ${spec.name}@$version нет tarball")
         val tgz = File(workspace.cache, "tmp-${UUID.randomUUID()}.tgz")
         try {
-            registry.downloadTarball(tarball, tgz)
+            registry.downloadTarball(tarball, tgz, versionMeta.optJSONObject("dist")?.optString("integrity"))
             pkgDir.mkdirs()
             TarReader.extract(tgz, pkgDir, "package/")
         } finally {
@@ -300,7 +300,7 @@ class NpxRuntime(
         if (targetDir.exists()) targetDir.deleteRecursively()
         val tgz = File(workspace.cache, "tmp-${UUID.randomUUID()}.tgz")
         try {
-            registry.downloadTarball(tarball, tgz)
+            registry.downloadTarball(tarball, tgz, versionMeta.optJSONObject("dist")?.optString("integrity"))
             targetDir.mkdirs()
             TarReader.extract(tgz, targetDir, "package/")
         } finally {
@@ -362,7 +362,10 @@ class NpxRuntime(
             }
             else -> return null
         } ?: return null
-        val f = File(pkgDir, rel).toPath().normalize().toFile()
-        return f.takeIf { it.isFile }
+        // A manifest can point `bin` anywhere ("../../../../shared_prefs/…"),
+        // so the resolved file has to be inside the sandbox before it is read
+        // as JavaScript.
+        val f = workspace.resolve(rel, pkgDir)?.takeIf { it.isFile } ?: return null
+        return f
     }
 }

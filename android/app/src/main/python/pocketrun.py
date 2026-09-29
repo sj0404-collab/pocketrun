@@ -3,6 +3,10 @@
 Kotlin owns the UI, the sandbox and process lifetime; everything that only makes
 sense in Python lives here: argv handling, sys.path setup, stream redirection and
 traceback formatting.
+
+User code runs inside the interpreter with the app's own uid, so `open` and `os`
+would reach the activation key in shared_prefs and every other project. The
+`pocketrun_sandbox` audit-hook jail is what keeps a script inside the workspace.
 """
 
 import io
@@ -11,6 +15,13 @@ import os
 import runpy
 import sys
 import traceback
+
+import pocketrun_sandbox
+
+# Nothing here is reachable from a script: the loopback interface (the app's own
+# java bridges and any local debug server), link-local addresses (cloud metadata)
+# and unix sockets (any local service).
+BLOCKED_HOSTS = ("localhost", "127.0.0.1", "::1", "0.0.0.0", "169.254.169.254")
 
 
 class PipeStream:
@@ -61,8 +72,12 @@ class PipeStream:
             pass
 
 
-def run(script, args_json, stdin_text, out_path, err_path, cwd):
-    """Runs ``script`` as __main__ and returns its exit code."""
+def run(script, args_json, stdin_text, out_path, err_path, cwd, sandbox_root=None):
+    """Runs ``script`` as __main__ and returns its exit code.
+
+    ``sandbox_root`` is the workspace directory; the script may read the Python
+    installation (stdlib, installed packages) but may only touch the workspace.
+    """
     if not os.path.isfile(script):
         _write_line(err_path, "python: no such file: %s" % script)
         return 2
@@ -106,16 +121,25 @@ def run(script, args_json, stdin_text, out_path, err_path, cwd):
     sys.stdout, sys.stderr = out, err
     code = 0
     try:
-        runpy.run_path(script, run_name="__main__")
-    except SystemExit as exc:
-        code = _exit_code(exc.code)
-    except KeyboardInterrupt:
-        _write_line(err_path, "KeyboardInterrupt")
-        code = 130
-    except BaseException:
-        traceback.print_exc(file=err)
-        code = 1
+        with pocketrun_sandbox.intercept(
+            read_roots=_read_roots(sandbox_root or cwd),
+            write_roots=[sandbox_root or cwd],
+            blocked_hosts=BLOCKED_HOSTS,
+        ):
+            try:
+                runpy.run_path(script, run_name="__main__")
+            except SystemExit as exc:
+                code = _exit_code(exc.code)
+            except KeyboardInterrupt:
+                _write_line(err_path, "KeyboardInterrupt")
+                code = 130
+            except BaseException:
+                # SandboxViolation lands here too: the traceback is the report.
+                traceback.print_exc(file=err)
+                code = 1
     finally:
+        # Restoring global state happens outside the jail: the previous working
+        # directory is the app's own, and the jail would refuse to go back to it.
         sys.stdout, sys.stderr, sys.stdin, sys.argv = previous[:4]
         out.close()
         err.close()
@@ -124,6 +148,18 @@ def run(script, args_json, stdin_text, out_path, err_path, cwd):
         except OSError:
             pass
     return code
+
+
+def _read_roots(sandbox_root):
+    """Where a script may read: the workspace plus the Python installation.
+
+    Chaquopy unpacks the interpreter, the standard library and every pip
+    package into the app's data directory, so the workspace alone is not enough
+    to run anything.
+    """
+    roots = [sandbox_root]
+    roots.extend(pocketrun_sandbox.interpreter_roots())
+    return roots
 
 
 def check_script(script):

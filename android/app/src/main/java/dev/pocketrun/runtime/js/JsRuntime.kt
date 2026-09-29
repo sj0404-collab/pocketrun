@@ -223,11 +223,18 @@ class JsRuntime(
         }
     }
 
+    /**
+     * The script to evaluate, sandboxed: `require` is already gated by
+     * [sandboxFile], and the entry point needs the same check — otherwise a
+     * script outside the workspace (a path from a stale run, a package `bin`
+     * pointing at `../../../shared_prefs/…`) would be evaluated as JavaScript.
+     */
     private fun readMainSource(request: ExecRequest): String {
-        val f = File(request.target)
-        if (!f.isFile) throw IllegalStateException("скрипт не найден: ${request.target}")
+        val file = workspace.resolve(request.target, request.cwd ?: workspace.root)
+            ?: throw IllegalStateException("путь вне рабочей папки отклонён: ${request.target}")
+        if (!file.isFile) throw IllegalStateException("скрипт не найден: ${request.target}")
         // Bin scripts start with a shebang; Rhino has no '#' comments.
-        return f.readText(Charsets.UTF_8).replace(Regex("^#![^\\n]*\\n?"), "")
+        return file.readText(Charsets.UTF_8).replace(Regex("^#![^\\n]*\\n?"), "")
     }
 
     private fun callGlobal(cx: Context, scope: Scriptable, name: String, args: () -> Array<Any?>): Any? {
