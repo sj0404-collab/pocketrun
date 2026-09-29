@@ -670,7 +670,6 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         refreshProjects()
         if (_projects.value.isEmpty()) createProject("hello")
         restoreAgentUi()
-        checkUpdateInBackground()
     }
 
     /**
@@ -943,12 +942,14 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private fun updateDir(): File = File(getApplication<Application>().cacheDir, "updates")
 
     /**
-     * One quiet check a day, on launch, and only once the app is licensed:
-     * nobody should wait on a network call to reach the projects list.
+     * One quiet check a day, once the app is up and licensed. Called from the
+     * UI, never from the constructor: a network call has no business in the
+     * middle of building the state this class is made of, and the license gate
+     * is not known until the first composition.
      */
-    private fun checkUpdateInBackground() {
-        if (updateChecked.getAndSet(true)) return
+    fun checkUpdateOnStart() {
         if (licenseState.value !is LicenseManager.LicenseState.Active) return
+        if (updateChecked.getAndSet(true)) return
         val prefs = getApplication<Application>().getSharedPreferences("updates", Context.MODE_PRIVATE)
         val last = prefs.getLong("lastCheck", 0L)
         val now = System.currentTimeMillis()

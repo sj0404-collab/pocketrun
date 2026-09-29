@@ -17,6 +17,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -30,6 +31,10 @@ import dev.pocketrun.license.LicenseManager
 @Composable
 fun PocketRunApp(viewModel: AppViewModel = viewModel()) {
     val license by viewModel.licenseState.collectAsState()
+    val licensed = license is LicenseManager.LicenseState.Active
+    LaunchedEffect(licensed) {
+        if (licensed) viewModel.checkUpdateOnStart()
+    }
     PocketRunTheme {
         Surface(modifier = Modifier.fillMaxSize()) {
             when (val state = license) {
