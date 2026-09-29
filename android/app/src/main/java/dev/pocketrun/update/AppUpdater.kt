@@ -43,7 +43,7 @@ class AppUpdater(private val repo: String, private val token: String = "") {
         partial.delete()
         target.delete()
         val connection = try {
-            open(url, "application/octet-stream")
+            open(URL(url), "application/octet-stream")
         } catch (e: Exception) {
             throw UpdateException("не удалось начать загрузку: ${e.message ?: e.javaClass.simpleName}")
         }
