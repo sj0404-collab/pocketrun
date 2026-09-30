@@ -40,6 +40,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import dev.pocketrun.runtime.OutputStream
@@ -54,9 +55,11 @@ fun EditorScreen(viewModel: AppViewModel) {
     val output by viewModel.output.collectAsState()
     val mode by viewModel.editorModeFlow.collectAsState()
     val npxCommand by viewModel.npxCommandFlow.collectAsState()
+    val editorFile by viewModel.editorFile.collectAsState()
+    val conflict by viewModel.diskConflict.collectAsState()
 
-    // Local editor state; reset when another project or mode is opened.
-    var text by rememberSaveable(selected?.name, mode) { mutableStateOf(script) }
+    // Local editor state; reset when another project, file or mode is opened.
+    var text by rememberSaveable(selected?.name, mode, editorFile?.absolutePath) { mutableStateOf(script) }
     var npxText by rememberSaveable(selected?.name) { mutableStateOf(npxCommand) }
 
     if (selected == null) {
@@ -72,12 +75,24 @@ fun EditorScreen(viewModel: AppViewModel) {
 
     Column(Modifier.fillMaxSize().padding(16.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            Text(
-                selected!!.name,
-                style = MaterialTheme.typography.titleLarge,
-                fontWeight = FontWeight.Bold,
-                modifier = Modifier.weight(1f),
-            )
+            Column(Modifier.weight(1f)) {
+                Text(
+                    editorFile?.name ?: "${selected!!.name} · ${if (mode == RuntimeKind.NODE) "main.js" else "main.py"}",
+                    style = MaterialTheme.typography.titleLarge,
+                    fontWeight = FontWeight.Bold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                if (editorFile != null) {
+                    Text(
+                        "${selected!!.name}/${editorFile!!.name}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            }
             when (runState) {
                 AppViewModel.RunState.Running -> Row(verticalAlignment = Alignment.CenterVertically) {
                     CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
@@ -122,6 +137,34 @@ fun EditorScreen(viewModel: AppViewModel) {
             )
         }
         Spacer(Modifier.height(8.dp))
+
+        if (conflict != null) {
+            // The agent edited the file this editor holds. Overwriting it silently
+            // would throw away the agent's work; reloading would throw away the
+            // user's typing, so the choice is theirs.
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(MaterialTheme.colorScheme.tertiaryContainer, RoundedCornerShape(8.dp))
+                    .padding(8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    "Файл изменился на диске — это мог сделать агент.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onTertiaryContainer,
+                    modifier = Modifier.weight(1f),
+                )
+                TextButton(onClick = viewModel::reloadFromDisk) { Text("Загрузить") }
+                TextButton(
+                    onClick = {
+                        // Saving is the user saying "my text is the one that counts".
+                        viewModel.saveScript(text)
+                    },
+                ) { Text("Оставить мой") }
+            }
+            Spacer(Modifier.height(8.dp))
+        }
 
         if (mode == RuntimeKind.NPX) {
             Column(Modifier.fillMaxWidth().weight(1.2f)) {

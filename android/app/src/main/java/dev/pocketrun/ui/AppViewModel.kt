@@ -3,6 +3,10 @@ package dev.pocketrun.ui
 import android.app.Application
 import android.content.Context
 import android.content.Intent
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.net.Uri
+import android.provider.OpenableColumns
 import androidx.core.content.FileProvider
 import androidx.lifecycle.AndroidViewModel
 import dev.pocketrun.BuildConfig
@@ -11,6 +15,17 @@ import dev.pocketrun.agent.LlmClient
 import dev.pocketrun.agent.opencode.OpenCodeAgent
 import dev.pocketrun.agent.opencode.OpenCodeTools
 import dev.pocketrun.agent.opencode.Sessions
+import dev.pocketrun.core.ContentSearch
+import dev.pocketrun.core.FileHistory
+import dev.pocketrun.core.FileKind
+import dev.pocketrun.core.FileNode
+import dev.pocketrun.core.FileOps
+import dev.pocketrun.core.FileText
+import dev.pocketrun.core.FileTree
+import dev.pocketrun.core.Mime
+import dev.pocketrun.core.SearchHit
+import dev.pocketrun.core.TreeFilter
+import dev.pocketrun.core.Version
 import dev.pocketrun.core.Workspace
 import dev.pocketrun.license.LicenseManager
 import dev.pocketrun.runtime.ExecRequest
@@ -30,6 +45,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import org.json.JSONArray
 import java.io.File
+import java.io.IOException
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -57,6 +73,73 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     private val _selected = MutableStateFlow<Project?>(null)
     val selected: StateFlow<Project?> = _selected.asStateFlow()
+
+    // -------------------------------------------------------------- the files
+
+    /**
+     * A project is a folder and the app finally treats it like one: every file in
+     * it is visible in the tree, openable, and kept in step with what the agent
+     * writes behind the app's back. These are the states behind that.
+     */
+    private val history = FileHistory.under(workspace)
+
+    private val _tree = MutableStateFlow<List<FileNode>>(emptyList())
+    val tree: StateFlow<List<FileNode>> = _tree.asStateFlow()
+
+    /** Absolute paths of the folders the user opened, so the tree keeps them open. */
+    private val _expandedDirs = MutableStateFlow<Set<String>>(emptySet())
+    val expandedDirs: StateFlow<Set<String>> = _expandedDirs.asStateFlow()
+
+    private val _treeFilter = MutableStateFlow(TreeFilter())
+    val treeFilter: StateFlow<TreeFilter> = _treeFilter.asStateFlow()
+
+    /** The file the bottom bar acts on. */
+    private val _inspected = MutableStateFlow<File?>(null)
+    val inspected: StateFlow<File?> = _inspected.asStateFlow()
+
+    /** The file open in the editor; null means the mode's entry point (main.py). */
+    private val _editorFile = MutableStateFlow<File?>(null)
+    val editorFile: StateFlow<File?> = _editorFile.asStateFlow()
+
+    /** Set when the open file changed on disk and the editor still holds the old text. */
+    private val _diskConflict = MutableStateFlow<File?>(null)
+    val diskConflict: StateFlow<File?> = _diskConflict.asStateFlow()
+
+    private val _preview = MutableStateFlow<FilePreview>(FilePreview.None)
+    val preview: StateFlow<FilePreview> = _preview.asStateFlow()
+
+    private val _searchHits = MutableStateFlow<List<SearchHit>>(emptyList())
+    val searchHits: StateFlow<List<SearchHit>> = _searchHits.asStateFlow()
+
+    private val _searching = MutableStateFlow(false)
+    val searching: StateFlow<Boolean> = _searching.asStateFlow()
+
+    private val _historyFor = MutableStateFlow<File?>(null)
+    val historyFor: StateFlow<File?> = _historyFor.asStateFlow()
+
+    private val _versions = MutableStateFlow<List<Version>>(emptyList())
+    val versions: StateFlow<List<Version>> = _versions.asStateFlow()
+
+    private val _notice = MutableStateFlow<String?>(null)
+    val notice: StateFlow<String?> = _notice.asStateFlow()
+
+    /** "Take me to the editor" - the file manager asks for the tab, not the tab bar. */
+    private val _tabRequest = MutableStateFlow<Int?>(null)
+    val tabRequest: StateFlow<Int?> = _tabRequest.asStateFlow()
+
+    private val watchExecutor: ExecutorService =
+        Executors.newSingleThreadExecutor { r -> Thread(r, "pocketrun-watch").apply { isDaemon = true } }
+
+    @Volatile
+    private var watching = false
+
+    /** Last seen tree fingerprint; a change in it is what triggers a rebuild. */
+    @Volatile
+    private var treePrint = ""
+
+    /** (size, mtime) of the file the editor currently holds, to notice edits under it. */
+    @Volatile
+    private var loadedPrint = ""
 
     /** Which tab of the editor is active: Python source, Node source or an npx command. */
     val editorMode = MutableStateFlow(RuntimeKind.PYTHON)
@@ -561,6 +644,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 _pendingQuestion.value = null
                 _pendingApproval.value = null
                 _agentRunning.value = false
+                // The agent writes files itself; the tree must not wait for the
+                // next poll to show what it did.
+                agentTouchedFiles()
             }
         }
     }
@@ -700,11 +786,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun refreshProjects() {
-        _projects.value = workspace.projects
-            .listFiles { file -> file.isDirectory }
-            .orEmpty()
-            .map { Project(it.name, it) }
-            .sortedBy { it.name.lowercase() }
+        _projects.value = currentProjects()
     }
 
     fun createProject(rawName: String) {
@@ -722,12 +804,477 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         if (_selected.value?.dir == project.dir) {
             _selected.value = null
             _script.value = ""
+            _editorFile.value = null
+            _tree.value = emptyList()
         }
         refreshProjects()
     }
 
+    // ------------------------------------------------------------ the files
+
+    /**
+     * Rebuilds the tree, but only when the folder really changed: a fingerprint
+     * of names, sizes and times is cheap enough to run every couple of seconds,
+     * while building thousands of nodes is not.
+     */
+    private fun rebuildTree(force: Boolean = false) {
+        val dir = _selected.value?.dir
+        if (dir == null) {
+            treePrint = ""
+            if (_tree.value.isNotEmpty()) _tree.value = emptyList()
+            return
+        }
+        val print = FileTree.fingerprint(dir)
+        if (!force && print == treePrint) return
+        treePrint = print
+        _tree.value = FileTree.build(dir, _expandedDirs.value, _treeFilter.value)
+    }
+
+    /** Any directory walk happens off the main thread: a project can be big. */
+    private fun rebuildTreeAsync(force: Boolean = false) {
+        ioExecutor.execute { rebuildTree(force) }
+    }
+
+    fun refreshFiles() {
+        _projects.value = currentProjects()
+        rebuildTreeAsync(force = true)
+    }
+
+    private fun currentProjects(): List<Project> = workspace.projects
+        .listFiles { file -> file.isDirectory }
+        .orEmpty()
+        .map { Project(it.name, it) }
+        .sortedBy { it.name.lowercase() }
+
+    /**
+     * Watches the project folder. The agent edits files from a background thread,
+     * the runtime writes output files, an import lands a photo from the gallery -
+     * none of it went through the UI, and the list used to stay stale until the
+     * app was restarted. The editor gets the same treatment: when the file it
+     * holds changes on disk, it says so instead of quietly saving over it.
+     */
+    private fun startWatching() {
+        if (watching) return
+        watching = true
+        watchExecutor.execute {
+            while (watching) {
+                try {
+                    rebuildTree()
+                    if (_projects.value.map { it.dir.name } != currentProjects().map { it.dir.name }) {
+                        _projects.value = currentProjects()
+                    }
+                    noticeDiskChange()
+                } catch (_: Throwable) {
+                    // A watch that dies silently would look like "the app is broken";
+                    // the next tick simply tries again.
+                }
+                try {
+                    Thread.sleep(WATCH_INTERVAL_MS)
+                } catch (_: InterruptedException) {
+                    return@execute
+                }
+            }
+        }
+    }
+
+    private fun stopWatching() {
+        watching = false
+        watchExecutor.shutdownNow()
+    }
+
+    private fun noticeDiskChange() {
+        val open = _editorFile.value ?: return
+        if (_diskConflict.value != null) return
+        if (stampOf(open) != loadedPrint) _diskConflict.value = open
+    }
+
+    private fun stampOf(file: File): String = "${file.length()}:${file.lastModified()}"
+
+    fun toggleFolder(file: File) {
+        val path = file.absolutePath
+        _expandedDirs.value =
+            if (path in _expandedDirs.value) _expandedDirs.value - path else _expandedDirs.value + path
+        rebuildTreeAsync()
+    }
+
+    fun setTreeQuery(query: String) {
+        _treeFilter.value = _treeFilter.value.copy(query = query)
+        rebuildTreeAsync()
+    }
+
+    fun setTreeKind(kind: FileKind?) {
+        _treeFilter.value = _treeFilter.value.copy(kind = if (_treeFilter.value.kind == kind) null else kind)
+        rebuildTreeAsync()
+    }
+
+    fun toggleHiddenFiles() {
+        _treeFilter.value = _treeFilter.value.copy(showHidden = !_treeFilter.value.showHidden)
+        rebuildTreeAsync()
+    }
+
+    fun clearTreeFilter() {
+        _treeFilter.value = TreeFilter()
+        _searchHits.value = emptyList()
+        rebuildTreeAsync()
+    }
+
+    fun inspect(file: File?) {
+        _inspected.value = file
+        if (file == null) _historyFor.value = null
+    }
+
+    /**
+     * Opens a file the way its type asks for: a folder expands, code and text go
+     * to the editor, and everything else goes to the built-in viewer or, when
+     * there is nothing to show it with, to a system app.
+     */
+    fun openFile(file: File) {
+        _inspected.value = file
+        val kind = FileTree.kindOf(file)
+        when {
+            kind == FileKind.FOLDER -> toggleFolder(file)
+            FileTree.isTextual(kind) -> openInEditor(file)
+            else -> showPreview(file)
+        }
+    }
+
+    private fun openInEditor(file: File) {
+        val project = _selected.value ?: return
+        ioExecutor.execute {
+            val text = FileText.read(file)
+            if (text == null) {
+                showNotice("«${file.name}» — не текст или больше 2 МБ")
+                showPreview(file)
+                return@execute
+            }
+            _editorFile.value = file
+            _script.value = text
+            loadedPrint = stampOf(file)
+            _diskConflict.value = null
+            _tabRequest.value = TAB_EDITOR
+            // Touching a project on disk is exactly what the list must reflect.
+            if (project.dir != _selected.value?.dir) rebuildTreeAsync(force = true)
+        }
+    }
+
+    /** Throws away the editor text and takes what is on disk right now. */
+    fun reloadFromDisk() {
+        val file = _editorFile.value ?: return
+        ioExecutor.execute {
+            val text = FileText.read(file) ?: run {
+                showNotice("файл прочитан как не текстовый")
+                return@execute
+            }
+            _script.value = text
+            loadedPrint = stampOf(file)
+            _diskConflict.value = null
+        }
+    }
+
+    fun createFile(name: String, folder: File? = null) {
+        val dir = targetFolder(folder) ?: return
+        val made = FileOps.createFile(dir, name)
+        if (made == null) {
+            showNotice("недопустимое имя файла")
+            return
+        }
+        rebuildTreeAsync(force = true)
+        openInEditor(made)
+    }
+
+    fun createFolder(name: String, into: File? = null) {
+        val dir = targetFolder(into) ?: return
+        if (FileOps.createDir(dir, name) == null) showNotice("не удалось создать папку")
+        rebuildTreeAsync(force = true)
+    }
+
+    fun renameEntry(file: File, name: String) {
+        val project = _selected.value ?: return
+        val target = FileOps.rename(file, name)
+        if (target == null) {
+            showNotice("недопустимое имя")
+            return
+        }
+        if (_editorFile.value?.absolutePath == file.absolutePath) {
+            _editorFile.value = target
+            loadedPrint = stampOf(target)
+        }
+        if (_inspected.value?.absolutePath == file.absolutePath) _inspected.value = target
+        history.prune(file, project.dir)
+        if (target.name != name.trim()) showNotice("имя занято, сохранено как «${target.name}»")
+        rebuildTreeAsync(force = true)
+    }
+
+    fun deleteEntry(file: File) {
+        val project = _selected.value ?: return
+        if (file.isFile) history.snapshot(file, project.dir)
+        if (!FileOps.delete(file)) {
+            showNotice("не удалось удалить «${file.name}»")
+            return
+        }
+        for (state in listOf(_editorFile, _inspected, _historyFor)) {
+            if (state.value?.absolutePath == file.absolutePath) state.value = null
+        }
+        if (_editorFile.value == null) {
+            _diskConflict.value = null
+            loadedPrint = ""
+            loadScriptForMode()
+        }
+        _preview.value = FilePreview.None
+        rebuildTreeAsync(force = true)
+    }
+
+    fun moveEntry(file: File, target: File) {
+        val project = _selected.value ?: return
+        val moved = FileOps.move(file, target)
+        if (moved == null) {
+            showNotice("нельзя переместить туда")
+            return
+        }
+        if (moved.absolutePath != file.absolutePath && project.dir == _selected.value?.dir) {
+            // keep the tree honest: the old path is gone, the new one is not expanded
+        }
+        rebuildTreeAsync(force = true)
+    }
+
+    private fun targetFolder(folder: File?): File? {
+        val project = _selected.value ?: return null
+        val dir = folder?.takeIf { it.isDirectory } ?: project.dir
+        return dir.takeIf { it.absolutePath.startsWith(project.dir.absolutePath) }
+    }
+
+    // ------------------------------------------------------------- importing
+
+    /**
+     * Copies what the user picked on the phone into the project. Read through the
+     * content resolver, so no storage permission is involved and SAF's own
+     * one-time grant is all that is needed.
+     */
+    fun importFromPhone(uris: List<Uri>, into: File? = null) {
+        val dir = targetFolder(into) ?: return
+        val resolver = getApplication<Application>().contentResolver
+        ioExecutor.execute {
+            var copied = 0
+            var failed = 0
+            for (uri in uris) {
+                val name = displayName(resolver, uri)
+                val target = FileOps.uniqueName(dir, FileOps.safeName(name) ?: "imported")
+                try {
+                    resolver.openInputStream(uri)?.use { input ->
+                        target.outputStream().use { out -> copyBounded(input, out) }
+                    } ?: throw IOException("не удалось открыть поток")
+                    copied++
+                } catch (e: IOException) {
+                    target.delete()
+                    failed++
+                    showNotice("«$name» не импортирован: ${e.message}")
+                }
+            }
+            if (copied > 0) showNotice("импортировано: $copied${if (failed > 0) ", пропущено: $failed" else ""}")
+            rebuildTree(force = true)
+        }
+    }
+
+    private fun displayName(resolver: android.content.ContentResolver, uri: Uri): String = runCatching {
+        resolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+            if (cursor.moveToFirst() && !cursor.isNull(0)) cursor.getString(0) else null
+        }
+    }.getOrNull() ?: "imported-${System.currentTimeMillis()}"
+
+    /** A photo from a camera can be hundreds of megabytes; the copy stops there. */
+    private fun copyBounded(input: java.io.InputStream, out: java.io.OutputStream) {
+        val buffer = ByteArray(64 * 1024)
+        var total = 0L
+        while (true) {
+            val read = input.read(buffer)
+            if (read <= 0) break
+            total += read
+            if (total > MAX_IMPORT_BYTES) throw IOException("файл больше ${FileText.human(MAX_IMPORT_BYTES)}")
+            out.write(buffer, 0, read)
+        }
+        out.flush()
+    }
+
+    // --------------------------------------------------------- system apps
+
+    fun openExternally(file: File) {
+        val intent = externalIntent(file, Intent.ACTION_VIEW)
+        if (intent == null) {
+            showNotice("нет приложения, открывающего ${FileTree.ext(file).ifEmpty { "этот тип" }}")
+            return
+        }
+        startIntent(intent)
+    }
+
+    fun shareFile(file: File) {
+        val intent = Intent(Intent.ACTION_SEND).apply {
+            type = Mime.of(file)
+            putExtra(Intent.EXTRA_STREAM, fileUri(file))
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        startIntent(Intent.createChooser(intent, "Поделиться ${file.name}"))
+    }
+
+    private fun externalIntent(file: File, action: String): Intent? {
+        val intent = Intent(action).apply {
+            setDataAndType(fileUri(file), Mime.of(file))
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        val resolved = getApplication<Application>().packageManager.resolveActivity(intent, 0)
+        return if (resolved != null) intent else null
+    }
+
+    private fun fileUri(file: File): Uri = FileProvider.getUriForFile(
+        getApplication(),
+        "${getApplication<Application>().packageName}.files",
+        file,
+    )
+
+    private fun startIntent(intent: Intent) {
+        try {
+            getApplication<Application>()
+                .startActivity(intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+        } catch (t: Throwable) {
+            showNotice("не удалось открыть: ${t.message ?: t.javaClass.simpleName}")
+        }
+    }
+
+    // ------------------------------------------------------------- previews
+
+    private fun showPreview(file: File) {
+        _inspected.value = file
+        when (FileTree.kindOf(file)) {
+            FileKind.IMAGE -> {
+                _preview.value = FilePreview.Loading
+                ioExecutor.execute {
+                    val bitmap = decodeImage(file)
+                    _preview.value = if (bitmap == null) {
+                        FilePreview.Failed("изображение не открылось")
+                    } else {
+                        FilePreview.Image(bitmap, file.name)
+                    }
+                }
+            }
+            FileKind.AUDIO -> _preview.value = FilePreview.Audio(file, Mime.of(file))
+            FileKind.VIDEO -> _preview.value = FilePreview.Video(file, Mime.of(file))
+            else -> _preview.value = FilePreview.Other(file, FileText.human(file.length()))
+        }
+    }
+
+    /** Downscaled so a 50-megapixel photo does not take the app down with it. */
+    private fun decodeImage(file: File): Bitmap? {
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeFile(file.path, bounds)
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+        var sample = 1
+        while (bounds.outWidth / (sample * 2) >= MAX_IMAGE_EDGE || bounds.outHeight / (sample * 2) >= MAX_IMAGE_EDGE) {
+            sample *= 2
+        }
+        return BitmapFactory.decodeFile(
+            file.path,
+            BitmapFactory.Options().apply {
+                inSampleSize = sample
+                inPreferredConfig = Bitmap.Config.RGB_565
+            },
+        )
+    }
+
+    fun closePreview() {
+        _preview.value = FilePreview.None
+    }
+
+    // ------------------------------------------------------ content search
+
+    fun searchContent(query: String, regex: Boolean = false, caseSensitive: Boolean = false) {
+        val project = _selected.value ?: return
+        if (query.isBlank()) {
+            _searchHits.value = emptyList()
+            return
+        }
+        _searching.value = true
+        val hidden = _treeFilter.value.showHidden
+        ioExecutor.execute {
+            val hits = try {
+                ContentSearch.search(project.dir, query, hidden, regex, caseSensitive)
+            } catch (t: Throwable) {
+                showNotice("поиск не удался: ${t.message}")
+                emptyList()
+            }
+            _searchHits.value = hits
+            _searching.value = false
+            if (hits.isEmpty()) showNotice("ничего не найдено")
+        }
+    }
+
+    fun clearSearch() {
+        _searchHits.value = emptyList()
+    }
+
+    // -------------------------------------------------------------- history
+
+    fun showHistory(file: File) {
+        val project = _selected.value ?: return
+        _historyFor.value = file
+        ioExecutor.execute { _versions.value = history.versionsOf(file, project.dir) }
+    }
+
+    fun closeHistory() {
+        _historyFor.value = null
+        _versions.value = emptyList()
+    }
+
+    fun restoreVersion(version: Version) {
+        val project = _selected.value ?: return
+        val file = _historyFor.value ?: return
+        ioExecutor.execute {
+            if (history.restore(version, file, project.dir)) {
+                showNotice("восстановлено")
+                rebuildTree(force = true)
+                if (_editorFile.value?.absolutePath == file.absolutePath) reloadFromDisk()
+            } else {
+                showNotice("не удалось восстановить")
+            }
+        }
+    }
+
+    /** A copy the user asked for, not one taken automatically before a write. */
+    fun snapshotNow(file: File) {
+        val project = _selected.value ?: return
+        ioExecutor.execute {
+            if (history.snapshot(file, project.dir) == null) showNotice("нечего сохранять")
+        }
+    }
+
+    // --------------------------------------------------------------- notices
+
+    private fun showNotice(message: String?) {
+        _notice.value = message
+    }
+
+    fun dismissNotice() {
+        _notice.value = null
+    }
+
+    fun tabRequestHandled() {
+        _tabRequest.value = null
+    }
+
+    /** Called when an agent turn ends, so its writes show up without waiting. */
+    fun agentTouchedFiles() {
+        rebuildTreeAsync(force = true)
+    }
+
     fun select(project: Project) {
         _selected.value = project
+        _editorFile.value = null
+        _inspected.value = null
+        _expandedDirs.value = emptySet()
+        _searchHits.value = emptyList()
+        _preview.value = FilePreview.None
+        _diskConflict.value = null
+        loadedPrint = ""
+        startWatching()
+        rebuildTreeAsync(force = true)
         loadScriptForMode()
     }
 
@@ -738,27 +1285,56 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun loadScriptForMode() {
         val project = _selected.value ?: return
-        when (editorMode.value) {
-            RuntimeKind.NODE -> {
-                val jsFile = File(project.dir, "main.js")
-                _script.value = jsFile.takeIf { it.isFile }?.readText(Charsets.UTF_8) ?: DEFAULT_JS_SCRIPT
+        // A file opened from the tree wins over the entry point: the user asked
+        // for that file, and the mode chips only choose what happens without it.
+        val open = _editorFile.value?.takeIf { it.isFile && it.parentFile?.let { p -> p.absolutePath.startsWith(project.dir.absolutePath) } == true }
+        if (open != null) {
+            ioExecutor.execute {
+                val text = FileText.read(open)
+                if (text == null) {
+                    showNotice("«${open.name}» не текстовый или слишком большой")
+                    return@execute
+                }
+                _script.value = text
+                loadedPrint = stampOf(open)
+                _diskConflict.value = null
             }
-            else -> {
-                _script.value = File(project.dir, "main.py")
-                    .takeIf { it.isFile }
-                    ?.readText(Charsets.UTF_8)
-                    ?: DEFAULT_SCRIPT
-            }
+            return
         }
+        val entry = entryPoint(project.dir)
+        val existing = entry.takeIf { it.isFile }?.let { FileText.read(it) }
+        loadedPrint = if (existing != null) stampOf(entry) else ""
+        _script.value = existing ?: templateFor(editorMode.value)
+        _diskConflict.value = null
     }
 
-    /** Saves the editor content under the active mode's file name. */
+    private fun entryPoint(dir: File): File = when (editorMode.value) {
+        RuntimeKind.NODE -> File(dir, "main.js")
+        else -> File(dir, "main.py")
+    }
+
+    private fun templateFor(mode: RuntimeKind): String =
+        if (mode == RuntimeKind.NODE) DEFAULT_JS_SCRIPT else DEFAULT_SCRIPT
+
+    /**
+     * Saves the editor content: the file that was opened from the tree, or the
+     * mode's entry point. The old content is snapshotted first, because a save
+     * overwrites whatever the agent put there.
+     */
     fun saveScript(text: String) {
         val project = _selected.value ?: return
-        when (editorMode.value) {
-            RuntimeKind.NODE -> File(project.dir, "main.js").writeText(text, Charsets.UTF_8)
-            else -> File(project.dir, "main.py").writeText(text, Charsets.UTF_8)
+        val file = _editorFile.value ?: entryPoint(project.dir)
+        history.snapshot(file, project.dir)
+        try {
+            file.parentFile?.mkdirs()
+            file.writeText(text, Charsets.UTF_8)
+        } catch (e: IOException) {
+            showNotice("не удалось сохранить: ${e.message}")
+            return
         }
+        loadedPrint = stampOf(file)
+        _diskConflict.value = null
+        rebuildTreeAsync(force = true)
     }
 
     fun runtimeAvailable(): Boolean = when (editorMode.value) {
@@ -850,6 +1426,26 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     fun activate(rawKey: String): Boolean = licenseManager.activate(rawKey)
 
     fun forgetLicense() = licenseManager.forget()
+
+    override fun onCleared() {
+        stopWatching()
+        super.onCleared()
+    }
+
+    /**
+     * What the built-in viewer is showing. Files the app cannot show itself end
+     * up in [Other] with a button that hands them to a system app, so nothing in
+     * a project is ever unopenable.
+     */
+    sealed interface FilePreview {
+        data object None : FilePreview
+        data object Loading : FilePreview
+        data class Image(val bitmap: Bitmap, val name: String) : FilePreview
+        data class Audio(val file: File, val mime: String) : FilePreview
+        data class Video(val file: File, val mime: String) : FilePreview
+        data class Other(val file: File, val size: String) : FilePreview
+        data class Failed(val message: String) : FilePreview
+    }
 
     // ------------------------------------------------------------- updates
 
@@ -961,6 +1557,17 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     companion object {
         private const val MAX_OUTPUT_LINES = 2_000
         private const val CHECK_INTERVAL_MS = 24L * 60 * 60 * 1000
+
+        /** How often the project folder is checked for changes made elsewhere. */
+        private const val WATCH_INTERVAL_MS = 2_000L
+
+        /** A single import: big enough for a video, small enough for a phone. */
+        private const val MAX_IMPORT_BYTES = 512L * 1024 * 1024
+
+        /** Longest edge of a decoded image; the rest is sampled away. */
+        private const val MAX_IMAGE_EDGE = 2048
+
+        private const val TAB_EDITOR = 1
 
         val DEFAULT_SCRIPT = """
             import sys

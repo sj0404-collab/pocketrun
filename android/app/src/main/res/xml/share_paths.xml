@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  What another app is allowed to read when the user shares or opens a project
+  file. The workspace only - not shared_prefs with the activation key, not the
+  release keystore, not the cache. Each grant is for one file and dies with the
+  intent that carried it.
+-->
+<paths>
+    <files-path
+        name="workspace"
+        path="workspace/" />
+</paths>

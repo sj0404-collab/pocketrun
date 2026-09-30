@@ -50,6 +50,17 @@ fun PocketRunApp(viewModel: AppViewModel = viewModel()) {
 private fun MainScreen(viewModel: AppViewModel, license: LicenseManager.LicenseState.Active) {
     var tab by rememberSaveable { mutableIntStateOf(0) }
 
+    // Opening a file from the tree asks for this tab; the tab bar does not know
+    // about the file manager, so the request travels through the model.
+    val tabRequest by viewModel.tabRequest.collectAsState()
+    LaunchedEffect(tabRequest) {
+        val requested = tabRequest
+        if (requested != null) {
+            tab = requested
+            viewModel.tabRequestHandled()
+        }
+    }
+
     Scaffold(
         topBar = {
             TopAppBar(title = { Text("PocketRun") })
