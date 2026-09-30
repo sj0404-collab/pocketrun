@@ -5,6 +5,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -264,7 +265,7 @@ fun ProjectsScreen(viewModel: AppViewModel) {
                 TreeRow(
                     node = node,
                     expanded = node.file.absolutePath in expanded,
-                    onClick = { viewModel.openFile(node.file) },
+                    onClick = { viewModel.activate(node.file) },
                     onLongPress = { viewModel.inspect(node.file) },
                 )
             }
@@ -283,6 +284,7 @@ fun ProjectsScreen(viewModel: AppViewModel) {
         if (inspected != null) {
             FileActionBar(
                 file = inspected!!,
+                expanded = inspected!!.absolutePath in expanded,
                 onOpen = { viewModel.openFile(inspected!!) },
                 onRename = { dialog = EntryDialog.Rename(inspected!!) },
                 onDelete = { dialog = EntryDialog.Delete(inspected!!) },
@@ -477,12 +479,13 @@ private fun FileToolbar(
     }
 }
 
+@OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
 @Composable
 private fun TreeRow(node: FileNode, expanded: Boolean, onClick: () -> Unit, onLongPress: () -> Unit) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable(onClick = onClick)
+            .combinedClickable(onClick = onClick, onLongClick = onLongPress)
             .padding(start = (4 + node.depth * 14).dp, end = 8.dp, top = 8.dp, bottom = 8.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
@@ -519,6 +522,7 @@ private fun TreeRow(node: FileNode, expanded: Boolean, onClick: () -> Unit, onLo
 @Composable
 private fun FileActionBar(
     file: java.io.File,
+    expanded: Boolean,
     onOpen: () -> Unit,
     onRename: () -> Unit,
     onDelete: () -> Unit,
@@ -542,7 +546,14 @@ private fun FileActionBar(
         )
         Row(verticalAlignment = Alignment.CenterVertically) {
             OutlinedButton(onClick = onOpen, contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 10.dp)) {
-                Text(if (file.isDirectory) "Открыть папку" else "Открыть", fontSize = 13.sp)
+                Text(
+                    when {
+                        !file.isDirectory -> "Открыть"
+                        expanded -> "Свернуть папку"
+                        else -> "Открыть папку"
+                    },
+                    fontSize = 13.sp,
+                )
             }
             Spacer(Modifier.width(6.dp))
             OutlinedButton(onClick = onHistory, contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 10.dp)) {

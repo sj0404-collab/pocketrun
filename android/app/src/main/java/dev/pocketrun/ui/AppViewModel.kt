@@ -813,9 +813,17 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     // ------------------------------------------------------------ the files
 
     /**
-     * Rebuilds the tree, but only when the folder really changed: a fingerprint
-     * of names, sizes and times is cheap enough to run every couple of seconds,
-     * while building thousands of nodes is not.
+     * Rebuilds the tree, but only when the result would actually differ: a
+     * fingerprint of names, sizes and times is cheap enough to run every couple
+     * of seconds, while building thousands of nodes is not.
+     *
+     * The fingerprint alone is not enough to decide that. It describes the disk
+     * and says nothing about what the user asked to see, so opening a folder or
+     * typing in the filter - both of which change the answer without touching a
+     * single byte on disk - compared equal to the previous stamp and the tree
+     * was never rebuilt. That is why "Открыть папку" did nothing: the row
+     * flipped to an open-folder icon with no children under it. The view state
+     * is therefore part of the stamp.
      */
     private fun rebuildTree(force: Boolean = false) {
         val dir = _selected.value?.dir
@@ -824,10 +832,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             if (_tree.value.isNotEmpty()) _tree.value = emptyList()
             return
         }
-        val print = FileTree.fingerprint(dir)
+        val expanded = _expandedDirs.value
+        val filter = _treeFilter.value
+        val print = FileTree.stamp(dir, expanded, filter)
         if (!force && print == treePrint) return
         treePrint = print
-        _tree.value = FileTree.build(dir, _expandedDirs.value, _treeFilter.value)
+        _tree.value = FileTree.build(dir, expanded, filter)
     }
 
     /** Any directory walk happens off the main thread: a project can be big. */
@@ -890,11 +900,28 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun stampOf(file: File): String = "${file.length()}:${file.lastModified()}"
 
+    /** Taps a row: a folder folds and unfolds, anything else opens. */
+    fun activate(file: File) {
+        if (file.isDirectory) toggleFolder(file) else openFile(file)
+    }
+
     fun toggleFolder(file: File) {
         val path = file.absolutePath
         _expandedDirs.value =
             if (path in _expandedDirs.value) _expandedDirs.value - path else _expandedDirs.value + path
         rebuildTreeAsync()
+    }
+
+    /**
+     * The "Открыть папку" button. Unlike a row tap this never folds a folder that
+     * is already open - pressing "open" on something that is open used to close
+     * it, because both paths ran the same toggle.
+     */
+    fun openFolder(file: File) {
+        if (file.absolutePath !in _expandedDirs.value) {
+            _expandedDirs.value = _expandedDirs.value + file.absolutePath
+            rebuildTreeAsync()
+        }
     }
 
     fun setTreeQuery(query: String) {
@@ -932,7 +959,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         _inspected.value = file
         val kind = FileTree.kindOf(file)
         when {
-            kind == FileKind.FOLDER -> toggleFolder(file)
+            kind == FileKind.FOLDER -> openFolder(file)
             FileTree.isTextual(kind) -> openInEditor(file)
             else -> showPreview(file)
         }

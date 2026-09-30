@@ -221,4 +221,23 @@ object FileTree {
         }
         return "$count:${java.lang.Long.toHexString(hash)}"
     }
+
+    /**
+     * Everything [build] is a function of, in one comparable string.
+     *
+     * [fingerprint] alone describes the disk and knows nothing about what the
+     * user asked to see, so opening a folder or typing in the filter looked like
+     * "nothing changed" and the tree was never rebuilt - the row flipped to an
+     * open-folder icon with no children under it. What the tree shows depends on
+     * three things, so the stamp has to cover all three.
+     */
+    fun stamp(root: File, expanded: Set<String>, filter: TreeFilter): String = buildString {
+        append(fingerprint(root))
+        append('|')
+        append(filter.query).append('\u0000')
+        append(filter.kind).append('\u0000')
+        append(filter.showHidden)
+        append('|')
+        expanded.sorted().forEach { append(it).append('\u0001') }
+    }
 }

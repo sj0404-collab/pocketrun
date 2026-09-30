@@ -1,11 +1,10 @@
 package dev.pocketrun.ui
 
+import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
-import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -14,6 +13,7 @@ import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -29,14 +29,18 @@ import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.AttachFile
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.ExpandLess
+import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Stop
@@ -62,6 +66,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
@@ -98,6 +103,8 @@ fun AgentScreen(viewModel: AppViewModel) {
     var input by remember { mutableStateOf("") }
     var showSettings by remember { mutableStateOf(false) }
     var showSessions by remember { mutableStateOf(false) }
+    // The plan folds away on a phone; on a wide screen it has a column of its own.
+    var planCollapsed by remember { mutableStateOf(false) }
 
     // Live "m:ss" ticker while the agent works.
     var elapsed by remember { mutableStateOf(0L) }
@@ -128,6 +135,8 @@ fun AgentScreen(viewModel: AppViewModel) {
         if (uri != null) viewModel.attachFile(uri)
     }
 
+    // The plan gets a column of its own once the screen is wide enough to spare one.
+    val sidePlan = LocalConfiguration.current.screenWidthDp >= 560
     Column(Modifier.fillMaxSize().imePadding()) {
         Row(
             verticalAlignment = Alignment.CenterVertically,
@@ -201,16 +210,21 @@ fun AgentScreen(viewModel: AppViewModel) {
             }
         }
 
-        if (todos.isNotEmpty()) {
-            TodoPanel(todos)
+        // On a tablet or in landscape the plan sits in a column on the right, so it
+        // no longer eats the chat's height; on a phone it stays above the chat but
+        // folds away to a one-line summary until it is wanted.
+        if (todos.isNotEmpty() && !sidePlan) {
+            TodoPanel(todos, collapsed = planCollapsed, onToggle = { planCollapsed = !planCollapsed })
         }
 
-        LazyColumn(
-            state = listState,
-            modifier = Modifier.fillMaxWidth().weight(1f),
-            contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 16.dp, vertical = 4.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
+        Row(Modifier.weight(1f)) {
+            Column(Modifier.weight(1f).fillMaxHeight()) {
+                LazyColumn(
+                    state = listState,
+                    modifier = Modifier.fillMaxWidth().weight(1f),
+                    contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 16.dp, vertical = 4.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
             if (messages.isEmpty()) {
                 item { AgentEmptyHint() }
             }
@@ -246,77 +260,89 @@ fun AgentScreen(viewModel: AppViewModel) {
                     }
                 }
             }
-            if (!running && messages.lastOrNull() is AppViewModel.AgentItem.Error) {
-                item {
-                    Row {
-                        TextButton(onClick = viewModel::retryLast) { Text("↻ Повторить") }
-                        TextButton(onClick = viewModel::continueLast) { Text("→ Продолжить (/continue)") }
+                    if (!running && messages.lastOrNull() is AppViewModel.AgentItem.Error) {
+                        item {
+                            Row {
+                                TextButton(onClick = viewModel::retryLast) { Text("↻ Повторить") }
+                                TextButton(onClick = viewModel::continueLast) { Text("→ Продолжить (/continue)") }
+                            }
+                        }
+                    }
+                }
+
+                pendingApproval?.let { pa ->
+                    ApprovalCard(pa)
+                }
+
+                pendingQuestion?.let { pq ->
+                    QuestionCard(pq)
+                }
+
+                Row(
+                    verticalAlignment = Alignment.Bottom,
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+                ) {
+                    val answering = pendingQuestion != null
+                    IconButton(
+                        onClick = { filePicker.launch(arrayOf("*/*")) },
+                        enabled = !running && !answering,
+                    ) {
+                        Icon(Icons.Filled.AttachFile, contentDescription = "Отправить файл агенту")
+                    }
+                    Spacer(Modifier.width(4.dp))
+                    OutlinedTextField(
+                        value = input,
+                        onValueChange = { input = it },
+                        modifier = Modifier.weight(1f),
+                        placeholder = { Text(if (answering) "Ваш ответ агенту…" else "Спросите агента… /help — справка") },
+                        maxLines = 4,
+                        enabled = !running || answering,
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    when {
+                        // The agent is blocked on a question: the main input answers it.
+                        answering -> {
+                            Button(
+                                onClick = {
+                                    pendingQuestion?.answer?.invoke(input.ifBlank { "(нет ответа)" })
+                                    input = ""
+                                },
+                                enabled = input.isNotBlank(),
+                            ) {
+                                Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Отправить ответ")
+                            }
+                            IconButton(onClick = viewModel::cancelAgent) {
+                                Icon(Icons.Filled.Stop, contentDescription = "Остановить")
+                            }
+                        }
+                        running -> {
+                            Button(onClick = viewModel::cancelAgent) {
+                                Icon(Icons.Filled.Stop, contentDescription = "Остановить (сессия сохранится)")
+                            }
+                        }
+                        else -> {
+                            Button(
+                                onClick = {
+                                    viewModel.sendToAgent(input)
+                                    input = ""
+                                },
+                                enabled = input.isNotBlank(),
+                            ) {
+                                Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Отправить")
+                            }
+                        }
                     }
                 }
             }
-        }
 
-        pendingApproval?.let { pa ->
-            ApprovalCard(pa)
-        }
-
-        pendingQuestion?.let { pq ->
-            QuestionCard(pq)
-        }
-
-        Row(
-            verticalAlignment = Alignment.Bottom,
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
-        ) {
-            val answering = pendingQuestion != null
-            IconButton(
-                onClick = { filePicker.launch(arrayOf("*/*")) },
-                enabled = !running && !answering,
-            ) {
-                Icon(Icons.Filled.AttachFile, contentDescription = "Отправить файл агенту")
-            }
-            Spacer(Modifier.width(4.dp))
-            OutlinedTextField(
-                value = input,
-                onValueChange = { input = it },
-                modifier = Modifier.weight(1f),
-                placeholder = { Text(if (answering) "Ваш ответ агенту…" else "Спросите агента… /help — справка") },
-                maxLines = 4,
-                enabled = !running || answering,
-            )
-            Spacer(Modifier.width(8.dp))
-            when {
-                // The agent is blocked on a question: the main input answers it.
-                answering -> {
-                    Button(
-                        onClick = {
-                            pendingQuestion?.answer?.invoke(input.ifBlank { "(нет ответа)" })
-                            input = ""
-                        },
-                        enabled = input.isNotBlank(),
-                    ) {
-                        Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Отправить ответ")
-                    }
-                    IconButton(onClick = viewModel::cancelAgent) {
-                        Icon(Icons.Filled.Stop, contentDescription = "Остановить")
-                    }
-                }
-                running -> {
-                    Button(onClick = viewModel::cancelAgent) {
-                        Icon(Icons.Filled.Stop, contentDescription = "Остановить (сессия сохранится)")
-                    }
-                }
-                else -> {
-                    Button(
-                        onClick = {
-                            viewModel.sendToAgent(input)
-                            input = ""
-                        },
-                        enabled = input.isNotBlank(),
-                    ) {
-                        Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Отправить")
-                    }
-                }
+            if (todos.isNotEmpty() && sidePlan) {
+                TodoPanel(
+                    todos = todos,
+                    modifier = Modifier
+                        .width(248.dp)
+                        .fillMaxHeight()
+                        .padding(end = 8.dp),
+                )
             }
         }
     }
@@ -363,39 +389,86 @@ private fun AgentEmptyHint() {
 
 // ------------------------------------------------------------------- todos
 
+/**
+ * The agent's plan.
+ *
+ * It used to render only the first twelve entries with no scroll and no count, so
+ * a hundred-step plan showed twelve lines and no hint that the rest existed - it
+ * read as if the agent had planned twelve things and stopped. Every entry is
+ * listed now, the list scrolls, and a finished step stays readable instead of
+ * being dropped. Docked to the right on a wide screen, folded to a one-line
+ * summary on a phone.
+ */
 @Composable
-private fun TodoPanel(todos: List<Sessions.Todo>) {
+private fun TodoPanel(
+    todos: List<Sessions.Todo>,
+    modifier: Modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 2.dp),
+    collapsed: Boolean = false,
+    onToggle: (() -> Unit)? = null,
+) {
+    val done = todos.count { it.isDone }
     Surface(
         color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.4f),
         shape = RoundedCornerShape(12.dp),
-        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 2.dp),
+        modifier = modifier,
     ) {
         Column(Modifier.padding(10.dp)) {
-            Text(
-                "План задач",
-                style = MaterialTheme.typography.labelMedium,
-                color = MaterialTheme.colorScheme.onSecondaryContainer,
-            )
-            Spacer(Modifier.height(4.dp))
-            todos.take(12).forEach { todo ->
-                Row(verticalAlignment = Alignment.Top) {
-                    val mark = when {
-                        todo.isDone -> "✓"
-                        todo.isActive -> "◐"
-                        else -> "○"
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text(
+                    "План задач",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSecondaryContainer,
+                )
+                Spacer(Modifier.weight(1f))
+                Text(
+                    "$done/${todos.size}",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSecondaryContainer,
+                )
+                if (onToggle != null) {
+                    IconButton(onClick = onToggle, modifier = Modifier.size(28.dp)) {
+                        Icon(
+                            if (collapsed) Icons.Filled.ExpandMore else Icons.Filled.ExpandLess,
+                            contentDescription = if (collapsed) "Показать план" else "Свернуть план",
+                            modifier = Modifier.size(18.dp),
+                        )
                     }
-                    val color = when {
-                        todo.isDone -> MaterialTheme.colorScheme.onSurfaceVariant
-                        todo.isActive -> MaterialTheme.colorScheme.primary
-                        else -> MaterialTheme.colorScheme.onSurfaceVariant
+                }
+            }
+            if (!collapsed) {
+                Spacer(Modifier.height(4.dp))
+                LazyColumn(Modifier.heightIn(max = 260.dp)) {
+                    items(todos.size) { i ->
+                        val todo = todos[i]
+                        val mark = when {
+                            todo.isDone -> "✓"
+                            todo.isActive -> "◐"
+                            else -> "○"
+                        }
+                        val color = if (todo.isDone) {
+                            MaterialTheme.colorScheme.onSurfaceVariant
+                        } else if (todo.isActive) {
+                            MaterialTheme.colorScheme.primary
+                        } else {
+                            MaterialTheme.colorScheme.onSurface
+                        }
+                        Row(Modifier.padding(vertical = 2.dp)) {
+                            Text(mark, color = color, style = MaterialTheme.typography.bodySmall)
+                            Spacer(Modifier.width(6.dp))
+                            Text(
+                                todo.content,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = if (todo.isDone) {
+                                    MaterialTheme.colorScheme.onSurfaceVariant
+                                } else {
+                                    MaterialTheme.colorScheme.onSurface
+                                },
+                            )
+                        }
                     }
-                    Text(mark, color = color, style = MaterialTheme.typography.bodySmall)
-                    Spacer(Modifier.width(6.dp))
-                    Text(
-                        todo.content,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = if (todo.isDone) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.onSurface,
-                    )
                 }
             }
         }
@@ -637,27 +710,53 @@ private fun SessionsDialog(viewModel: AppViewModel, onDismiss: () -> Unit) {
 
 // ---------------------------------------------------------------- bubbles
 
-/** Long-press on any bubble copies its text. */
-@OptIn(ExperimentalFoundationApi::class)
+/**
+ * A chat bubble that can be read, selected and copied.
+ *
+ * Two ways to copy, because they answer different needs. The button copies the
+ * whole message, which is what you want to paste into a bug report. Dragging over
+ * the text selects it and the system toolbar copies only the selection. They used
+ * to be one gesture - a long press on the bubble - which always copied the entire
+ * message no matter how much of it was highlighted, and because the surface
+ * swallowed the gesture there was no way to select a few lines at all.
+ */
 @Composable
-private fun CopyableSurface(contentAlignment: Alignment, shape: RoundedCornerShape, color: androidx.compose.ui.graphics.Color, text: String, content: @Composable () -> Unit) {
+private fun CopyableSurface(
+    contentAlignment: Alignment,
+    shape: RoundedCornerShape,
+    color: androidx.compose.ui.graphics.Color,
+    text: String,
+    content: @Composable () -> Unit,
+) {
     val clipboard = LocalClipboardManager.current
     val context = LocalContext.current
     Box(Modifier.fillMaxWidth(), contentAlignment = contentAlignment) {
         Surface(
             color = color,
             shape = shape,
-            modifier = Modifier
-                .widthIn(max = 340.dp)
-                .combinedClickable(
-                    onClick = {},
-                    onLongClick = {
-                        clipboard.setText(AnnotatedString(text))
-                        android.widget.Toast.makeText(context, "Скопировано", android.widget.Toast.LENGTH_SHORT).show()
-                    },
-                ),
+            modifier = Modifier.widthIn(max = 340.dp),
         ) {
-            content()
+            Column {
+                SelectionContainer(Modifier.fillMaxWidth()) { content() }
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.End,
+                ) {
+                    IconButton(
+                        onClick = {
+                            clipboard.setText(AnnotatedString(text))
+                            Toast.makeText(context, "Сообщение скопировано", Toast.LENGTH_SHORT).show()
+                        },
+                        modifier = Modifier.size(32.dp),
+                    ) {
+                        Icon(
+                            Icons.Filled.ContentCopy,
+                            contentDescription = "Скопировать сообщение",
+                            modifier = Modifier.size(16.dp),
+                        )
+                    }
+                }
+            }
         }
     }
 }
@@ -709,43 +808,54 @@ private fun AgentBubble(item: AppViewModel.AgentItem) {
     }
 }
 
-/** Long-press on a tool row copies the call and its result. */
-@OptIn(ExperimentalFoundationApi::class)
+/** A tool call: selectable text, and a button that copies just this call. */
 @Composable
 private fun ToolRow(item: AppViewModel.AgentItem.Tool) {
     val clipboard = LocalClipboardManager.current
     val context = LocalContext.current
+    val full = "🛠 ${item.name} ${item.args}\n${item.result ?: ""}"
     Surface(
         color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
         shape = RoundedCornerShape(10.dp),
         modifier = Modifier.fillMaxWidth(),
     ) {
-        Column(
-            Modifier.padding(10.dp).combinedClickable(
-                onClick = {},
-                onLongClick = {
-                    clipboard.setText(AnnotatedString("🛠 ${item.name} ${item.args}\n${item.result ?: ""}"))
-                    android.widget.Toast.makeText(context, "Скопировано", android.widget.Toast.LENGTH_SHORT).show()
-                },
-            ),
-        ) {
-            Text(
-                "🛠 ${item.name}${if (item.args.isNotBlank()) " · ${item.args.take(120)}" else ""}",
-                style = MaterialTheme.typography.bodySmall,
-                fontFamily = FontFamily.Monospace,
-                color = MaterialTheme.colorScheme.secondary,
-            )
-            if (item.result != null && item.result.isNotBlank()) {
-                Spacer(Modifier.height(4.dp))
-                Text(
-                    item.result.take(400) + if (item.result.length > 400) "…" else "",
-                    style = MaterialTheme.typography.bodySmall,
-                    fontFamily = FontFamily.Monospace,
-                    fontSize = 11.sp,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    maxLines = 8,
-                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
-                )
+        Column(Modifier.padding(10.dp)) {
+            SelectionContainer(Modifier.fillMaxWidth()) {
+                Column {
+                    Text(
+                        "🛠 ${item.name}${if (item.args.isNotBlank()) " · ${item.args.take(120)}" else ""}",
+                        style = MaterialTheme.typography.bodySmall,
+                        fontFamily = FontFamily.Monospace,
+                        color = MaterialTheme.colorScheme.secondary,
+                    )
+                    if (item.result != null && item.result.isNotBlank()) {
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            item.result.take(400) + if (item.result.length > 400) "…" else "",
+                            style = MaterialTheme.typography.bodySmall,
+                            fontFamily = FontFamily.Monospace,
+                            fontSize = 11.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 8,
+                            overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                        )
+                    }
+                }
+            }
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                IconButton(
+                    onClick = {
+                        clipboard.setText(AnnotatedString(full))
+                        Toast.makeText(context, "Вызов скопирован", Toast.LENGTH_SHORT).show()
+                    },
+                    modifier = Modifier.size(32.dp),
+                ) {
+                    Icon(
+                        Icons.Filled.ContentCopy,
+                        contentDescription = "Скопировать вызов",
+                        modifier = Modifier.size(16.dp),
+                    )
+                }
             }
         }
     }

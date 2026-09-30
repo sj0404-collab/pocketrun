@@ -1,5 +1,6 @@
 package dev.pocketrun.agent.opencode
 
+import dev.pocketrun.core.FileText
 import dev.pocketrun.core.Workspace
 import dev.pocketrun.runtime.js.JsRuntime
 import dev.pocketrun.runtime.npm.NpxRuntime
@@ -24,7 +25,12 @@ class OpenCodeTools(
 ) {
 
     companion object {
+        /** How much of a file one `read` call may return. */
         private const val MAX_READ = 32 * 1024
+
+        /** Refuse to slurp a file bigger than this rather than paging through a gigabyte. */
+        private const val MAX_READ_FILE_BYTES = 4_000_000L
+
         private const val MAX_TOOL_OUTPUT = 16 * 1024
         private const val MAX_WEB = 24 * 1024
 
@@ -105,7 +111,10 @@ class OpenCodeTools(
         )
         tool(
             "read",
-            "Read a text file (max ${MAX_READ} chars). Supports optional offset (1-based line) and limit.",
+            "Read a text file, one page at a time. Returns a header with the file's line count and " +
+                "the exact offset for the next page - call read again with that offset until it says " +
+                "\"это конец файла\". Returns at most ${MAX_READ} chars per call, so a long file takes " +
+                "several calls; use grep to jump to the interesting part instead of reading blind.",
             JSONObject()
                 .put("filePath", str("filePath", "path relative to the project root"))
                 .put("offset", int("offset", "1-based line number to start from"))
@@ -306,20 +315,81 @@ class OpenCodeTools(
         return out.trim().take(MAX_TOOL_OUTPUT)
     }
 
+    /**
+     * Reads a file, a page at a time.
+     *
+     * The result used to be cut at [MAX_READ] and end with a bare "\u2026 (обрезано)": the
+     * model was left believing the file had ended there, so a 60 KB source was
+     * only ever seen through its first 32 KB and no amount of retrying helped.
+     * Every page now carries its own line window, how much is left, and the exact
+     * `offset` for the next call, so a long file can actually be read to the end.
+     */
     private fun doRead(args: JSONObject): String {
         val f = resolve(args.getString("filePath")) ?: return "error: путь вне песочницы"
         if (!f.exists()) return "error: файл не найден: ${args.getString("filePath")}"
         if (f.isDirectory) return "error: это каталог, используйте list"
-        val text = f.readText(Charsets.UTF_8)
+        if (FileText.looksBinary(f)) {
+            return "error: ${f.name} — двоичный файл (${FileText.human(f.length())}), читать как текст нельзя"
+        }
+        if (f.length() > MAX_READ_FILE_BYTES) {
+            return "error: ${f.name} — ${FileText.human(f.length())} больше, чем читать целиком " +
+                "(${FileText.human(MAX_READ_FILE_BYTES)}); читай частями через grep или offset/limit"
+        }
+        val lines = f.readLines(Charsets.UTF_8)
+        val total = lines.size
         val offset = args.optInt("offset", 1).coerceAtLeast(1)
-        val limit = args.optInt("limit", 0)
-        val lines = text.lines()
-        val from = (offset - 1).coerceIn(0, lines.size)
-        val to = if (limit > 0) minOf(from + limit, lines.size) else lines.size
-        val picked = lines.subList(from, to)
-        val body = picked.joinToString("\n")
-        return (body.take(MAX_READ) + if (body.length > MAX_READ) "\n… (обрезано)" else "")
-            .ifEmpty { "(пустой файл)" }
+        val requested = args.optInt("limit", 0)
+        val from = (offset - 1).coerceIn(0, total)
+
+        // Spend the budget line by line so a page never ends mid-word, unless a
+        // single line is longer than the whole budget.
+        val window = if (requested > 0) requested else Int.MAX_VALUE
+        var used = 0
+        var count = 0
+        while (from + count < total && count < window) {
+            val cost = lines[from + count].length + 1
+            if (used + cost > MAX_READ) break
+            used += cost
+            count++
+        }
+        val cutLine = count == 0 && from < total
+        val body = when {
+            cutLine -> lines[from].take(MAX_READ)
+            else -> lines.subList(from, from + count).joinToString("\n")
+        }
+        return readPage(f, total, from, body, count, cutInsideLine = cutLine)
+    }
+
+    /**
+     * A read result with a header the model can act on: the real size of the
+     * file, the window it just saw, and the `offset` to pass for the next one.
+     */
+    private fun readPage(
+        file: File,
+        total: Int,
+        from: Int,
+        body: String,
+        count: Int,
+        cutInsideLine: Boolean,
+    ): String {
+        val rel = workspace.relativeTo(file)
+        val firstLine = from + 1
+        val lastLine = if (cutInsideLine) firstLine else firstLine + count - 1
+        val left = (total - lastLine).coerceAtLeast(0)
+        val header = buildString {
+            append(rel).append(" — ").append(total).append(" строк, ").append(FileText.human(file.length()))
+            append(" · строки ").append(firstLine)
+            if (lastLine > firstLine) append('-').append(lastLine)
+            if (cutInsideLine) append(" (строка длиннее ответа, обрезана)")
+            if (left > 0) {
+                append(" · осталось ").append(left).append("\nдалее: read(filePath=\"")
+                append(rel).append("\", offset=").append(lastLine + 1).append(')')
+            } else {
+                append(" · это конец файла")
+            }
+            append("\n---\n")
+        }
+        return if (body.isEmpty()) header + "(пусто)" else header + body
     }
 
     private fun doWrite(args: JSONObject): String {
