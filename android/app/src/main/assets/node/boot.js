@@ -984,10 +984,6 @@
     if (src === null) { throw err("Cannot read module '" + file + "'"); }
     // Bin scripts may be required as libraries; strip their shebang too.
     if (src.charCodeAt(0) === 35) { src = src.replace(/^#![^\n]*\n?/, ''); }
-    // Rhino has no async functions. `async function` (keyword + keyword) is
-    // unambiguous, so drop the modifier: no-await async functions keep working,
-    // and everything else was already unparseable on Rhino.
-    src = src.replace(/\basync[ \t\r\n]+function\b/g, 'function');
     var dir = path.dirname(file);
     if (file.endsWith('.json')) {
       mod.exports = JSON.parse(src);

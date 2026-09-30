@@ -169,7 +169,7 @@ class NpmRegistry(private val baseUrl: String = "https://registry.npmjs.org/") {
         conn.readTimeout = 120_000
         conn.instanceFollowRedirects = true
         // npmjs.org rejects requests without a user agent.
-        conn.setRequestProperty("User-Agent", "pocketrun-npm/1.2 (Rhino)")
+        conn.setRequestProperty("User-Agent", "pocketrun-npm/1.3 (QuickJS)")
         return conn
     }
 

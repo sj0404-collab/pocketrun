@@ -183,15 +183,16 @@ class NpxRuntime(
     }
 
     /**
-     * Rhino understands a large ES6 subset but no class/async/import/for-of-const.
-     * When a package fails on that, say so plainly instead of a bare parse error.
+     * A plain parse failure. Modern syntax is no longer the reason - the engine
+     * understands class/async/import - so the hint only appears when the module
+     * really is written in something other than JavaScript.
      */
     private fun withSyntaxHint(stderr: String): String {
         if (!stderr.contains("Cannot parse module")) return stderr
         return stderr + "\n" +
-            "⚠ Пакет использует синтаксис, который встроенный JS-движок не понимает\n" +
-            "  (class / async-await / import-export / spread). Часто помогает более старая\n" +
-            "  версия пакета — например cowsay@1.4.0 вместо cowsay@latest.\n"
+            "⚠ Модуль не разобрался как JavaScript. Если это TypeScript или coffeescript,\n" +
+            "  сначала собери его в .js; если синтаксис обычный - скорее всего, пакет\n" +
+            "  рассчитан на Node и зовёт нативный модуль (child_process, fs.createReadStream).\n"
     }
 
     // ---------------------------------------------------------------- install

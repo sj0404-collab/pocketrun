@@ -1,6 +1,10 @@
 package dev.pocketrun.runtime.js
 
 import android.util.Log
+import com.dokar.quickjs.QuickJs
+import com.dokar.quickjs.QuickJsException
+import com.dokar.quickjs.binding.define
+import com.dokar.quickjs.binding.function
 import dev.pocketrun.core.Workspace
 import dev.pocketrun.runtime.ExecRequest
 import dev.pocketrun.runtime.ExecResult
@@ -8,13 +12,9 @@ import dev.pocketrun.runtime.ExecutionHandle
 import dev.pocketrun.runtime.OutputListener
 import dev.pocketrun.runtime.OutputTailer
 import dev.pocketrun.runtime.OutputStream
-import org.mozilla.javascript.BaseFunction
-import org.mozilla.javascript.Context
-import org.mozilla.javascript.Function
-import org.mozilla.javascript.RhinoException
-import org.mozilla.javascript.Scriptable
-import org.mozilla.javascript.ScriptableObject
-import org.mozilla.javascript.Undefined
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.runBlocking
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
@@ -23,6 +23,7 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.util.UUID
 import java.util.concurrent.Callable
+import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ExecutionException
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -32,16 +33,24 @@ import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * The JavaScript runtime: Rhino evaluating [bootSource] (node/boot.js from the
- * APK assets) into a fresh safe scope per run, plus the event loop the boot
- * script drives through its `__pr*` hooks.
+ * The JavaScript runtime: QuickJS evaluating [bootSource] (node/boot.js from the
+ * APK assets) plus the event loop the boot script drives through its `__pr*`
+ * hooks.
  *
- * The bridge contract lives at the top of boot.js; this class is its only
+ * This used to be Rhino 1.8.1, which is what forced boot.js to be written in ES5
+ * and quietly broke every modern npm package: Rhino cannot parse `class`,
+ * `async`/`await`, generators, optional chaining or ES modules, so a package would
+ * install successfully and then fail to load with a syntax error the user could do
+ * nothing about. QuickJS understands all of it, which is the entire reason for the
+ * swap.
+ *
+ * The bridge contract still lives at the top of boot.js; this class is its only
  * implementation. Scripts reach the outside world only through the bridge, and
- * every filesystem call is contained inside the workspace root by [Workspace.resolve].
+ * every filesystem call is contained inside the workspace root by
+ * [Workspace.resolve].
  *
- * Runs are serialized on one worker thread (Rhino contexts are not shareable);
- * output is streamed through per-run log files exactly like PythonRuntime.
+ * Runs are serialized on one worker thread; output is streamed through per-run log
+ * files exactly like PythonRuntime.
  */
 class JsRuntime(
     private val bootSource: String,
@@ -55,7 +64,14 @@ class JsRuntime(
         private const val TAILER_JOIN_MS = 2_000L
         private const val MAX_READ = 16 * 1024 * 1024
         private const val MAX_HTTP_BODY = 4 * 1024 * 1024
-        const val VERSION = "Rhino 1.8.1 (ES6,interpreted)"
+
+        /** A runaway script gets stopped by the engine itself, not just by the loop. */
+        private const val MAX_HEAP_BYTES = 512L * 1024 * 1024
+
+        /** Deep recursion in a script must produce a stack error, never a native crash. */
+        private const val MAX_STACK_BYTES = 4L * 1024 * 1024
+
+        const val VERSION = "QuickJS (ES2023)"
     }
 
     private val executor: ExecutorService = Executors.newSingleThreadExecutor { runnable ->
@@ -125,10 +141,10 @@ class JsRuntime(
     /**
      * Runs [request] to completion (waiting for the worker) and returns the
      * result. On timeout the run is flagged cancelled and a 124 result is
-     * returned. Used by the agent's run_node tool.
+     * returned. Used by the agent's bash tool and the editor.
      */
     fun executeSync(request: ExecRequest, timeoutMs: Long): ExecResult {
-        val done = java.util.concurrent.CompletableFuture<ExecResult>()
+        val done = CompletableFuture<ExecResult>()
         val handle = execute(request, object : OutputListener {
             override fun onFinished(result: ExecResult) { done.complete(result) }
             override fun onFailed(error: Throwable) { done.completeExceptionally(error) }
@@ -145,32 +161,34 @@ class JsRuntime(
 
     // ---------------------------------------------------------------- engine
 
-    private fun runLocked(state: RunState, cancelled: AtomicBoolean): Int {
-        val cx = Context.enter()
+    /**
+     * One QuickJS instance per run, driven to completion on the worker thread.
+     *
+     * [runBlocking] is not a compromise here: the worker exists precisely so a run
+     * owns a thread for its whole life, and the JS job dispatcher inside the engine
+     * needs a free pool to resolve promises on while this one waits.
+     */
+    private fun runLocked(state: RunState, cancelled: AtomicBoolean): Int = runBlocking {
+        val js = QuickJs.create(Dispatchers.Default)
         try {
-            cx.languageVersion = Context.VERSION_ES6
-            cx.optimizationLevel = -1 // no bytecode generation: required on Android
-            val scope = cx.initSafeStandardObjects()
-            installBridge(cx, scope, state)
-            cx.evaluateString(scope, bootSource, "boot.js", 1, null)
+            js.memoryLimit = MAX_HEAP_BYTES
+            js.maxStackSize = MAX_STACK_BYTES
+            js.evaluationTimeoutMillis = maxRunMs
+            installBridge(js, state)
+            js.eval(bootSource, "boot.js")
 
             // Entry module resolves relative requires against its own directory.
             val target = state.request.target
             if (target.startsWith("/")) {
                 val dir = target.substringBeforeLast('/', "")
-                callGlobal(cx, scope, "__setMainDir") { arrayOf<Any?>(dir) }
+                js.eval("__setMainDir(${JSONObject.quote(dir)})", "runtime")
             }
 
             var exitCode = try {
-                val source = readMainSource(state.request)
-                cx.evaluateString(scope, source, state.request.target, 1, null)
+                js.eval(readMainSource(state.request), state.request.target)
                 0
-            } catch (e: RhinoException) {
-                state.errWriter.write(
-                    "ERROR at line ${e.lineNumber()} in ${e.sourceName()}: ${e.details()}\n" +
-                        e.getScriptStackTrace() + "\n",
-                )
-                state.errWriter.flush()
+            } catch (e: QuickJsException) {
+                reportJsError(state, e)
                 1
             }
 
@@ -179,18 +197,17 @@ class JsRuntime(
             while (true) {
                 if (System.currentTimeMillis() - loopStart > maxRunMs) {
                     if (exitCode == 0) exitCode = 124
-                    state.errWriter.write("run timeout after ${maxRunMs / 1000}s\n"); state.errWriter.flush()
+                    writeErr(state, "run timeout after ${maxRunMs / 1000}s\n")
                     break
                 }
-                val ex = callGlobal(cx, scope, "__prExitCode") { arrayOfNulls(0) }
-                if (ex != null && ex != Undefined.instance) {
-                    exitCode = Context.toNumber(ex).toInt()
+                val exit = js.eval("__prExitCode()", "eventloop").asNumberOrNull()
+                if (exit != null) {
+                    exitCode = exit.toInt()
                     break
                 }
                 if (cancelled.get()) { exitCode = 130; break }
-                val pending = Context.toNumber(callGlobal(cx, scope, "__prPending") { arrayOfNulls(0) })
-                if (pending <= 0.0) break
-                val next = Context.toNumber(callGlobal(cx, scope, "__prNextDue") { arrayOfNulls(0) })
+                if (js.eval("__prPending()", "eventloop").asNumber() <= 0.0) break
+                val next = js.eval("__prNextDue()", "eventloop").asNumber()
                 val now = System.currentTimeMillis()
                 if (next > now + 1.0) {
                     try {
@@ -203,29 +220,49 @@ class JsRuntime(
                     continue
                 }
                 try {
-                    callGlobal(cx, scope, "__prRunDue") { arrayOfNulls(0) }
-                } catch (e: RhinoException) {
+                    js.eval("__prRunDue()", "eventloop")
+                } catch (e: QuickJsException) {
                     // boot.js already isolates per-callback failures; this is a last resort
-                    state.errWriter.write("event loop error: ${e.details()}\n"); state.errWriter.flush()
+                    writeErr(state, "event loop error: ${e.message}\n")
                     if (exitCode == 0) exitCode = 1
                     break
                 }
             }
-            try {
-                callGlobal(cx, scope, "__prOnExit") { arrayOfNulls(0) }
-            } catch (_: Exception) { }
+            runCatching { js.eval("__prOnExit()", "eventloop") }
             state.outWriter.flush()
             state.errWriter.flush()
-            return exitCode
+            exitCode
         } finally {
-            try { state.outWriter.flush(); state.errWriter.flush() } catch (_: Exception) {}
-            Context.exit()
+            runCatching { state.outWriter.flush(); state.errWriter.flush() }
+            runCatching { js.close() }
         }
     }
 
     /**
+     * A script error, formatted the way the runtime has always reported it so the
+     * model sees the same "ERROR at line N in file" it learned to parse.
+     */
+    private fun reportJsError(state: RunState, e: QuickJsException) {
+        val where = e.lineNumber?.let { "ERROR at line $it in ${e.fileName ?: "script"}" }
+            ?: "ERROR in ${e.fileName ?: "script"}"
+        writeErr(state, "$where: ${e.message}\n${e.stack ?: ""}\n")
+    }
+
+    /**
+     * Evaluates [code] and returns its value.
+     *
+     * Always `Any?` on purpose: QuickJS hands back whole numbers as `Long`, and a
+     * declared `Double`/`String` target makes the engine throw on the conversion
+     * rather than on the script. `undefined` arrives as `null`, which is also what
+     * a Kotlin `null` becomes on the way in - boot.js checks `=== null` to mean
+     * "no such file", so that distinction has to survive.
+     */
+    private suspend fun QuickJs.eval(code: String, file: String): Any? =
+        evaluate<Any?>(code, file, false)
+
+    /**
      * The script to evaluate, sandboxed: `require` is already gated by
-     * [sandboxFile], and the entry point needs the same check — otherwise a
+     * [sandboxFile], and the entry point needs the same check - otherwise a
      * script outside the workspace (a path from a stale run, a package `bin`
      * pointing at `../../../shared_prefs/…`) would be evaluated as JavaScript.
      */
@@ -233,15 +270,14 @@ class JsRuntime(
         val file = workspace.resolve(request.target, request.cwd ?: workspace.root)
             ?: throw IllegalStateException("путь вне рабочей папки отклонён: ${request.target}")
         if (!file.isFile) throw IllegalStateException("скрипт не найден: ${request.target}")
-        // Bin scripts start with a shebang; Rhino has no '#' comments.
+        // Bin scripts start with a shebang; JavaScript has no '#' comments.
         return file.readText(Charsets.UTF_8).replace(Regex("^#![^\\n]*\\n?"), "")
     }
 
-    private fun callGlobal(cx: Context, scope: Scriptable, name: String, args: () -> Array<Any?>): Any? {
-        val fn = scope.get(name, scope)
-        if (fn is Function) return fn.call(cx, scope, scope, args())
-        return null
-    }
+    private fun Any?.asNumber(): Double = (this as? Number)?.toDouble() ?: 0.0
+
+    /** Null for `undefined` and for a real null, so "no exit code" stays distinct from 0. */
+    private fun Any?.asNumberOrNull(): Double? = (this as? Number)?.toDouble()
 
     private fun stopTailers(outTailer: OutputTailer, errTailer: OutputTailer) {
         // The tailers watch log files that this thread just closed; give them a
@@ -253,120 +289,98 @@ class JsRuntime(
     // ---------------------------------------------------------------- bridge
 
     /**
-     * Installs the `__pr` object with every function boot.js calls. Functions
-     * are BaseFunction subclasses (NOT javaToJS): the safe scope must not see
-     * arbitrary Java objects.
+     * Installs the `__pr` object with every function boot.js calls.
+     *
+     * The scope QuickJS hands a script is already its own realm: there is no Java
+     * object graph reachable from it, only values crossing this boundary.
      */
-    private fun installBridge(cx: Context, scope: Scriptable, state: RunState) {
-        val bridge = cx.newObject(scope)
-        ScriptableObject.putProperty(scope, "__pr", bridge)
+    private fun installBridge(js: QuickJs, state: RunState) {
+        fun str(args: Array<out Any?>, i: Int): String? = args.getOrNull(i)?.toString()
 
-        fun method(name: String, fn: (Array<Any?>) -> Any?) {
-            ScriptableObject.putProperty(bridge, name, object : BaseFunction() {
-                // NOTE: a Kotlin null here becomes JS null — boot.js checks
-                // `=== null` for "no such file" and friends, so mapping null to
-                // undefined would silently break those checks.
-                override fun call(c: Context, s: Scriptable, thisObj: Scriptable, args: Array<Any?>?): Any? {
-                    return fn(args ?: arrayOfNulls(0))
-                }
-            })
-        }
+        js.define("__pr") {
+            function("root") { _ -> workspace.root.absolutePath }
+            function("now") { _ -> System.currentTimeMillis() }
 
-        fun str(a: Array<Any?>, i: Int): String? = a.getOrNull(i)?.let { if (it === Undefined.instance) null else Context.toString(it) }
+            function("print") { a -> str(a, 0)?.let { writeOut(state, it) } }
+            function("printErr") { a -> str(a, 0)?.let { writeErr(state, it) } }
 
-        method("root") { workspace.root.absolutePath }
-        method("now") { System.currentTimeMillis().toDouble() }
-
-        method("print") { a -> str(a, 0)?.let { writeOut(state, it) } }
-        method("printErr") { a -> str(a, 0)?.let { writeErr(state, it) } }
-
-        method("argv") {
-            // Must be exactly Object[] for Context.newArray (see Rhino's checks).
-            val list = buildList<Any?> {
-                add("node")
-                add(state.request.target)
-                state.request.args.forEach { add(it) }
+            function("argv") {
+                listOf("node", state.request.target) + state.request.args
             }
-            cx.newArray(scope, list.toTypedArray())
-        }
-        method("env") {
-            val pairs = buildList<Any?> {
-                add("HOME=${workspace.root.absolutePath}")
-                add("PATH=/usr/local/bin:/usr/bin:/bin")
-                add("LANG=C.UTF-8")
-                add("NODE_ENV=production")
-                add("TMPDIR=${File(workspace.cache, "tmp").apply { mkdirs() }.absolutePath}")
+            function("env") {
+                listOf(
+                    "HOME=${workspace.root.absolutePath}",
+                    "PATH=/usr/local/bin:/usr/bin:/bin",
+                    "LANG=C.UTF-8",
+                    "NODE_ENV=production",
+                    "TMPDIR=${File(workspace.cache, "tmp").apply { mkdirs() }.absolutePath}",
+                )
             }
-            cx.newArray(scope, pairs.toTypedArray())
-        }
 
-        method("cwd") { state.cwd.absolutePath }
-        method("chdir") { a ->
-            val d = str(a, 0) ?: return@method false
-            val resolved = workspace.resolve(d, state.cwd) ?: return@method false
-            if (resolved.isDirectory) { state.cwd = resolved; true } else false
-        }
+            function("cwd") { _ -> state.cwd.absolutePath }
+            function("chdir") { a ->
+                val d = str(a, 0) ?: return@function false
+                val resolved = workspace.resolve(d, state.cwd) ?: return@function false
+                if (resolved.isDirectory) { state.cwd = resolved; true } else false
+            }
 
-        method("fsRead") { a ->
-            val f = sandboxFile(str(a, 0)) ?: return@method null
-            if (!f.isFile || f.length() > MAX_READ) null else f.readText(Charsets.UTF_8)
-        }
-        method("fsWrite") { a ->
-            val f = sandboxFile(str(a, 0)) ?: return@method false
-            try {
-                f.parentFile?.mkdirs()
-                f.writeText(str(a, 1) ?: "", Charsets.UTF_8)
-                true
-            } catch (t: Throwable) { false }
-        }
-        method("fsAppend") { a ->
-            val f = sandboxFile(str(a, 0)) ?: return@method false
-            try {
-                f.parentFile?.mkdirs()
-                f.appendText(str(a, 1) ?: "", Charsets.UTF_8)
-                true
-            } catch (t: Throwable) { false }
-        }
-        method("fsExists") { a -> sandboxFile(str(a, 0))?.exists() == true }
-        method("fsIsDir") { a -> sandboxFile(str(a, 0))?.isDirectory == true }
-        method("fsList") { a ->
-            val f = sandboxFile(str(a, 0)) ?: return@method null
-            if (!f.isDirectory) return@method null
-            val names: Array<Any?> = f.list()?.sorted()?.map { it as Any? }?.toTypedArray()
-                ?: arrayOfNulls<Any?>(0)
-            cx.newArray(scope, names)
-        }
-        method("fsSize") { a ->
-            val f = sandboxFile(str(a, 0))
-            (f?.takeIf { it.isFile }?.length() ?: 0L).toDouble()
-        }
-        method("fsMtime") { a ->
-            val f = sandboxFile(str(a, 0))
-            (f?.takeIf { it.exists() }?.lastModified() ?: 0L).toDouble()
-        }
-        method("fsMkdir") { a ->
-            val f = sandboxFile(str(a, 0)) ?: return@method false
-            try { f.mkdirs(); true } catch (t: Throwable) { false }
-        }
-        method("fsDelete") { a ->
-            val f = sandboxFile(str(a, 0)) ?: return@method false
-            f.isFile && f.delete()
-        }
-        method("fsRename") { a ->
-            val from = sandboxFile(str(a, 0)) ?: return@method false
-            val to = sandboxFile(str(a, 1)) ?: return@method false
-            try {
-                to.parentFile?.mkdirs()
-                from.renameTo(to)
-            } catch (t: Throwable) { false }
-        }
+            function("fsRead") { a ->
+                val f = sandboxFile(str(a, 0)) ?: return@function null
+                if (!f.isFile || f.length() > MAX_READ) null else f.readText(Charsets.UTF_8)
+            }
+            function("fsWrite") { a ->
+                val f = sandboxFile(str(a, 0)) ?: return@function false
+                try {
+                    f.parentFile?.mkdirs()
+                    f.writeText(str(a, 1) ?: "", Charsets.UTF_8)
+                    true
+                } catch (t: Throwable) { false }
+            }
+            function("fsAppend") { a ->
+                val f = sandboxFile(str(a, 0)) ?: return@function false
+                try {
+                    f.parentFile?.mkdirs()
+                    f.appendText(str(a, 1) ?: "", Charsets.UTF_8)
+                    true
+                } catch (t: Throwable) { false }
+            }
+            function("fsExists") { a -> sandboxFile(str(a, 0))?.exists() == true }
+            function("fsIsDir") { a -> sandboxFile(str(a, 0))?.isDirectory == true }
+            function("fsList") { a ->
+                val f = sandboxFile(str(a, 0)) ?: return@function null
+                if (!f.isDirectory) return@function null
+                f.list()?.sorted() ?: emptyList<String>()
+            }
+            function("fsSize") { a ->
+                (sandboxFile(str(a, 0))?.takeIf { it.isFile }?.length() ?: 0L)
+            }
+            function("fsMtime") { a ->
+                (sandboxFile(str(a, 0))?.takeIf { it.exists() }?.lastModified() ?: 0L)
+            }
+            function("fsMkdir") { a ->
+                val f = sandboxFile(str(a, 0)) ?: return@function false
+                try { f.mkdirs(); true } catch (t: Throwable) { false }
+            }
+            function("fsDelete") { a ->
+                val f = sandboxFile(str(a, 0)) ?: return@function false
+                f.isFile && f.delete()
+            }
+            function("fsRename") { a ->
+                val from = sandboxFile(str(a, 0)) ?: return@function false
+                val to = sandboxFile(str(a, 1)) ?: return@function false
+                try {
+                    to.parentFile?.mkdirs()
+                    from.renameTo(to)
+                } catch (t: Throwable) { false }
+            }
 
-        method("http") { a ->
-            val method = str(a, 0)?.uppercase() ?: "GET"
-            val url = str(a, 1) ?: return@method null
-            val headers = str(a, 2) ?: "{}"
-            val body = str(a, 3)
-            httpBridge(method, url, headers, body)
+            function("http") { a ->
+                val method = str(a, 0)?.uppercase() ?: "GET"
+                val url = str(a, 1) ?: return@function null
+                val headers = str(a, 2) ?: "{}"
+                val body = str(a, 3)
+                httpBridge(method, url, headers, body)
+            }
         }
     }
 

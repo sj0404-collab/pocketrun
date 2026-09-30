@@ -59,7 +59,7 @@ gradle.taskGraph.whenReady {
 
 android {
     namespace = "dev.pocketrun"
-    compileSdk = 35
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "dev.pocketrun"
@@ -122,7 +122,11 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
 
-    kotlinOptions { jvmTarget = "17" }
+    kotlin {
+        compilerOptions {
+            jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
+        }
+    }
 
     packaging {
         resources {
@@ -144,6 +148,17 @@ android {
 tasks.withType<Test>().configureEach {
     environment("LANG", "C.UTF-8")
     environment("LC_ALL", "C.UTF-8")
+}
+
+// quickjs-kt ships its engine as an Android .so, which a desktop JVM cannot
+// load. The -jvm artifact is the identical engine built for the host, so the
+// boot.js suite still runs on CI. Android builds are untouched: only the unit
+// test classpath is redirected.
+configurations.matching { it.name.endsWith("UnitTestRuntimeClasspath") }.configureEach {
+    resolutionStrategy.dependencySubstitution {
+        substitute(module("io.github.dokar3:quickjs-kt-android"))
+            .using(module("io.github.dokar3:quickjs-kt-jvm:1.0.14"))
+    }
 }
 
 /**
@@ -210,8 +225,19 @@ dependencies {
     implementation("androidx.navigation:navigation-compose:2.8.4")
     implementation("androidx.documentfile:documentfile:1.0.1")
 
-    implementation("org.mozilla:rhino:1.8.1")
     implementation("net.i2p.crypto:eddsa:0.3.0")
+
+    /**
+     * The JavaScript engine. QuickJS understands the whole of ES2023 - classes,
+     * async/await, generators, optional chaining, ES modules - which is the whole
+     * reason it replaced Rhino: under Rhino every npm package written in modern
+     * JavaScript failed to parse with a syntax error, so `npm install` could fetch
+     * a package and then refuse to run it. The -jvm artifact is the same engine
+     * built for the desktop, substituted below so boot.js keeps being unit
+     * tested on CI, where no Android .so can be loaded.
+     */
+    implementation("io.github.dokar3:quickjs-kt-android:1.0.14")
+    testRuntimeOnly("io.github.dokar3:quickjs-kt-jvm:1.0.14")
 
     testImplementation("junit:junit:4.13.2")
 
