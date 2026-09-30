@@ -33,15 +33,33 @@ class MiniShell(
         /** `sleep` in the sandbox: long enough to wait for a job, short enough not to hang a turn. */
         const val MAX_SLEEP_SECONDS = 120f
         val COMMANDS = listOf(
-            "cat", "cd", "cp", "date", "echo", "env", "false", "find", "grep", "head",
-            "ls", "mkdir", "mv", "node", "npm", "npx", "pwd", "python", "rm", "sleep", "tail",
-            "touch", "true", "uname", "wc", "which", "help",
+            // файлы и каталоги
+            "cat", "cd", "chmod", "cp", "find", "head", "ln", "ls", "mkdir", "mv", "pwd",
+            "realpath", "readlink", "rm", "stat", "tail", "touch", "tree",
+            // текст
+            "awk", "basename", "cut", "diff", "dirname", "expand", "fold", "jq", "nl",
+            "printf", "rev", "sed", "seq", "sort", "tac", "tee", "tr", "uniq", "wc",
+            // система
+            "base64", "date", "df", "du", "env", "false", "file", "history", "hostname",
+            "id", "md5sum", "mktemp", "ps", "sha256sum", "sleep", "test", "true",
+            "uname", "which", "xxd", "kill", "[",
+            // сеть и архивы
+            "curl", "wget", "gunzip", "gzip", "unzip", "zip",
+            // версии и запуск
+            "git", "node", "npm", "npx", "python",
+            "echo", "grep", "help",
         )
         private val HELP = """
             Доступные команды: ${COMMANDS.joinToString(" ")}
             python <file.py> | python -c '<код>'   — CPython 3.13 (стандартная библиотека)
-            node <file.js>  | node -e '<код>'      — Node-совместимый слой (без class/async/import)
-            npx <пакет> [аргументы]               — чистые JS npm-пакеты
+            node <file.js>  | node -e '<код>'      — Node-совместимый слой на QuickJS (ES2023)
+            npx <пакет> [аргументы]               — JS npm-пакеты из registry.npmjs.org
+            git init|status|add|commit|log|show|diff|branch|checkout|restore|reset
+                                                   — локальная история изменений
+            curl [-o файл] [-d данные] [-H h] URL — скачать или отправить запрос
+            jq -r '.a.b[0]' файл.json           — достать значение из JSON
+            sed 's/a/b/g' file | awk '{print $1}' | sort -u
+            stat / du -sh / df / tree / file      — размеры, содержимое, место
             npm init -y | npm install <пакет> | npm run <скрипт> | npm ls
                                                    — управление node-проектом (install качает
                                                      чистые JS-пакеты; require() их видит)
@@ -144,6 +162,7 @@ class MiniShell(
                 "npx" -> runNpx(args, dir, timeoutMs)
                 "npm" -> npm(args, dir, timeoutMs)
                 else -> runBuiltin(cmd, args, dir, input, onCd)
+                ?: runExtended(cmd, args, dir, input)
             }
             exit = r.exitCode
             input = r.output
@@ -168,8 +187,7 @@ class MiniShell(
 
     // ---------------------------------------------------------------- builtins
 
-    private fun runBuiltin(cmd: String, args: List<String>, dir: File, stdin: String, onCd: (File) -> Unit): Result {
-        return when (cmd) {
+    private fun runBuiltin(cmd: String, args: List<String>, dir: File, stdin: String, onCd: (File) -> Unit): Result? = when (cmd) {
             "pwd" -> Result(0, dir.relativeToOrNull(workspace.root)?.let { "./$it" } ?: dir.absolutePath + "\n")
             "cd" -> {
                 val target = sandboxPath(args.firstOrNull() ?: ".", dir)
@@ -178,7 +196,7 @@ class MiniShell(
             }
             "ls" -> ls(args, dir)
             "cat" -> cat(args, dir, stdin)
-            "echo" -> Result(0, args.joinToString(" ") + "\n")
+            "echo" -> echo(args)
             "mkdir" -> mkdir(args, dir)
             "rm" -> rm(args, dir)
             "mv" -> mv(args, dir)
@@ -210,11 +228,68 @@ class MiniShell(
             "true" -> Result(0, "")
             "false" -> Result(1, "")
             "help" -> Result(0, HELP + "\n")
-            else -> Result(127, "bash: $cmd: команда не найдена (доступно: ${COMMANDS.joinToString(", ")})\n")
+            // Not a builtin: the extended groups get a turn before giving up.
+            else -> null
         }
-    }
+
+    /** Text tools, system tools, network, archives and git. */
+    private fun runExtended(cmd: String, args: List<String>, dir: File, stdin: String): Result =
+        ShellText.run(cmd, args, dir, stdin, ShellText.Resolve(::sandboxPath))
+            ?: ShellSystem.run(cmd, args, dir, stdin, ShellText.Resolve(::sandboxPath))
+            ?: ShellIO.run(cmd, args, dir, stdin, ShellText.Resolve(::sandboxPath))
+            ?: ShellGit.run(cmd, args, dir, ShellText.Resolve(::sandboxPath))
+            ?: Result(127, "bash: $cmd: команда не найдена (доступно: ${COMMANDS.joinToString(", ")})\n")
 
     private fun flagsFree(args: List<String>): List<String> = args.filter { !it.startsWith("-") }
+
+    /**
+     * `echo` with the flags a pipeline actually depends on: `-n` swallows the
+     * newline and `-e` interprets backslash escapes. Without `-n`,
+     * `echo -n abc | sha256sum` digests the text "-n abc" - which is how a whole
+     * class of checksum and base64 recipes silently produces the wrong answer.
+     */
+    private fun echo(argsIn: List<String>): Result {
+        var newline = true
+        var escapes = false
+        var i = 0
+        while (i < argsIn.size) {
+            val a = argsIn[i]
+            if (a == "-n") newline = false
+            else if (a == "-e") escapes = true
+            else if (a == "-E") escapes = false
+            else if (a == "--") { i++; break }
+            else break
+            i++
+        }
+        var text = argsIn.drop(i).joinToString(" ")
+        if (escapes) text = unescape(text)
+        return Result(0, text + if (newline) "\n" else "")
+    }
+
+    private fun unescape(text: String): String {
+        val out = StringBuilder()
+        var i = 0
+        while (i < text.length) {
+            val c = text[i]
+            if (c != '\\' || i + 1 >= text.length) { out.append(c); i++; continue }
+            when (val n = text[i + 1]) {
+                'n' -> out.append('\n')
+                't' -> out.append('\t')
+                'r' -> out.append('\r')
+                '0' -> out.append('\u0000')
+                'a' -> out.append('\u0007')
+                'b' -> out.append('\b')
+                'f' -> out.append('\u000C')
+                'v' -> out.append('\u000B')
+                '\\' -> out.append('\\')
+                '"' -> out.append('"')
+                '\'' -> out.append('\'')
+                else -> out.append(n)
+            }
+            i += 2
+        }
+        return out.toString()
+    }
 
     private fun ls(args: List<String>, dir: File): Result {
         val all = args.any { it == "-a" || it == "-la" || it == "-al" }

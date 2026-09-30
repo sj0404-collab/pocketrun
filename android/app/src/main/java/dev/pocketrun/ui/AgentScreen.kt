@@ -44,6 +44,7 @@ import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Stop
+import androidx.compose.material.icons.filled.Wallpaper
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
@@ -166,6 +167,9 @@ fun AgentScreen(viewModel: AppViewModel) {
             ) {
                 Icon(Icons.Filled.History, contentDescription = "Сессии")
             }
+            IconButton(onClick = { viewModel.openWallpaperPicker() }) {
+                Icon(Icons.Filled.Wallpaper, contentDescription = "Живые обои")
+            }
             IconButton(onClick = { showSettings = true }) {
                 Icon(Icons.Filled.Settings, contentDescription = "Настройки")
             }
@@ -229,7 +233,7 @@ fun AgentScreen(viewModel: AppViewModel) {
                 item { AgentEmptyHint() }
             }
             itemsIndexed(messages) { _, item ->
-                AgentBubble(item)
+                AgentBubble(item, viewModel)
             }
             if (running) {
                 item {
@@ -762,7 +766,7 @@ private fun CopyableSurface(
 }
 
 @Composable
-private fun AgentBubble(item: AppViewModel.AgentItem) {
+private fun AgentBubble(item: AppViewModel.AgentItem, viewModel: AppViewModel) {
     when (item) {
         is AppViewModel.AgentItem.User -> CopyableSurface(
             contentAlignment = Alignment.CenterEnd,
@@ -805,7 +809,68 @@ private fun AgentBubble(item: AppViewModel.AgentItem) {
             modifier = Modifier.padding(horizontal = 8.dp),
         )
         is AppViewModel.AgentItem.Tool -> ToolRow(item)
+        is AppViewModel.AgentItem.Media -> MediaBubble(item, viewModel)
     }
+}
+
+/** A one-field dialog for rewording a prompt, local to the chat. */
+@Composable
+private fun PromptNameDialog(
+    title: String,
+    label: String,
+    initial: String,
+    onDismiss: () -> Unit,
+    onConfirm: (String) -> Unit,
+) {
+    var text by remember { mutableStateOf(initial) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(title) },
+        text = {
+            OutlinedTextField(
+                value = text,
+                onValueChange = { text = it },
+                label = { Text(label) },
+                singleLine = false,
+                minLines = 2,
+            )
+        },
+        confirmButton = {
+            TextButton(onClick = { onConfirm(text) }, enabled = text.isNotBlank()) { Text("Ок") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Отмена") } },
+    )
+}
+
+/** A file the agent produced, with a preview and the actions that make sense on it. */
+@Composable
+private fun MediaBubble(item: AppViewModel.AgentItem.Media, viewModel: AppViewModel) {
+    var reasking by remember(item.file.absolutePath) { mutableStateOf(false) }
+    val prompt = item.prompt
+
+    if (reasking) {
+        PromptNameDialog(
+            title = "Новый промт",
+            label = "что изменить в запросе",
+            initial = prompt.orEmpty(),
+            onDismiss = { reasking = false },
+            onConfirm = { next ->
+                reasking = false
+                viewModel.askAboutMedia(item.file, "Сделай версию с другим запросом: «$next».")
+            },
+        )
+    }
+
+    MediaCard(
+        file = item.file,
+        kind = item.kind,
+        prompt = prompt,
+        onOpen = { viewModel.openMedia(item.file) },
+        onSave = { viewModel.exportMedia(item.file) },
+        onShare = { viewModel.shareFile(item.file) },
+        onRegenerate = { viewModel.askAboutMedia(item.file, "Сделай другой вариант.") },
+        onReprompt = { reasking = true },
+    )
 }
 
 /** A tool call: selectable text, and a button that copies just this call. */

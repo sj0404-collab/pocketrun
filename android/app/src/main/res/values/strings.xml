@@ -1,4 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">PocketRun</string>
+    <string name="live_wallpaper_label">PocketRun — живые обои</string>
+    <string name="live_wallpaper_description">Показывает картинки из папки обоев, медленно переключая их. Снимите обои стандартным способом Android.</string>
 </resources>

@@ -2,6 +2,8 @@ package dev.pocketrun.ui
 
 import android.app.Application
 import android.content.Context
+import android.app.WallpaperManager
+import android.content.ComponentName
 import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
@@ -202,6 +204,13 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         data class Tool(val name: String, val args: String, val result: String?) : AgentItem
         data class Error(val text: String) : AgentItem
         data class Info(val text: String) : AgentItem
+
+        /**
+         * Something the agent produced that can be shown, not just read: a picture,
+         * a sound, a video, an animation. Carries the prompt it was made from when
+         * one is known, so the card can offer to try again with different wording.
+         */
+        data class Media(val file: File, val kind: FileKind, val prompt: String?) : AgentItem
     }
 
     private val _agentMessages = MutableStateFlow<List<AgentItem>>(emptyList())
@@ -518,6 +527,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         _modelPreview.value = ""
         _turnStartedAt.value = System.currentTimeMillis()
         val turnStart = _turnStartedAt.value
+        lastUserPrompt = userText
 
         agentExecutor.execute {
             try {
@@ -645,8 +655,11 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 _pendingApproval.value = null
                 _agentRunning.value = false
                 // The agent writes files itself; the tree must not wait for the
-                // next poll to show what it did.
+                // next poll to show what it did, and anything it produced that can
+                // be seen or heard belongs in the conversation, not only in the
+                // file tree.
                 agentTouchedFiles()
+                publishTurnMedia(turnStart)
             }
         }
     }
@@ -1157,13 +1170,14 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         file,
     )
 
-    private fun startIntent(intent: Intent) {
-        try {
-            getApplication<Application>()
-                .startActivity(intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
-        } catch (t: Throwable) {
-            showNotice("не удалось открыть: ${t.message ?: t.javaClass.simpleName}")
-        }
+    /** Launches [intent]; false when nothing on the device can handle it. */
+    private fun startIntent(intent: Intent): Boolean = try {
+        getApplication<Application>()
+            .startActivity(intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+        true
+    } catch (t: Throwable) {
+        showNotice("не удалось открыть: ${t.message ?: t.javaClass.simpleName}")
+        false
     }
 
     // ------------------------------------------------------------- previews
@@ -1178,7 +1192,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     _preview.value = if (bitmap == null) {
                         FilePreview.Failed("изображение не открылось")
                     } else {
-                        FilePreview.Image(bitmap, file.name)
+                        FilePreview.Image(bitmap, file.name, file)
                     }
                 }
             }
@@ -1289,6 +1303,140 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     /** Called when an agent turn ends, so its writes show up without waiting. */
     fun agentTouchedFiles() {
         rebuildTreeAsync(force = true)
+    }
+
+    // ------------------------------------------------------------ chat media
+
+    /**
+     * Shows what the agent just produced that can be seen or heard.
+     *
+     * The agent's writes are text-only as far as the chat is concerned: a picture
+     * it saved appeared in the file tree, but nothing in the conversation, and the
+     * user had to go looking for it. So at the end of a turn the project folder is
+     * scanned for media that appeared or changed during it, and each one becomes
+     * a card in the chat.
+     *
+     * Files that are already on screen as a card are not repeated, and anything
+     * the user picked up before the turn started is left alone.
+     */
+    private fun publishTurnMedia(since: Long) {
+        val project = _selected.value?.dir ?: workspace.root
+        if (!project.isDirectory) return
+        val shown = _agentMessages.value
+            .filterIsInstance<AgentItem.Media>()
+            .map { it.file.absolutePath }
+            .toSet()
+
+        val found = mutableListOf<File>()
+        var count = 0
+        val stack = ArrayDeque<File>()
+        stack.addLast(project)
+        while (stack.isNotEmpty() && count < 4_000) {
+            val dir = stack.removeLast()
+            for (child in dir.listFiles().orEmpty()) {
+                count++
+                val name = child.name
+                if (name.startsWith(".")) continue
+                if (child.isDirectory) {
+                    // node_modules and build output are the agent's dependencies,
+                    // not things it made for the user to look at.
+                    if (name !in FileTree.SKIP_DIRS && name !in MEDIA_SKIP_DIRS) stack.addLast(child)
+                    continue
+                }
+                val kind = FileTree.kindOf(child)
+                if (kind != FileKind.IMAGE && kind != FileKind.AUDIO && kind != FileKind.VIDEO) continue
+                if (child.absolutePath in shown) continue
+                if (child.length() < 512) continue
+                // "Changed during this turn" is the honest test: a file whose mtime
+                // predates the turn was already there.
+                if (child.lastModified() + 2_000 < since) continue
+                found += child
+                if (found.size >= 6) break
+            }
+            if (found.size >= 6) break
+        }
+        if (found.isEmpty()) return
+
+        val prompt = lastUserPrompt
+        _agentMessages.update { items ->
+            found.sortedBy { it.lastModified() }.fold(items) { acc, file ->
+                acc + AgentItem.Media(file, FileTree.kindOf(file), prompt)
+            }
+        }
+    }
+
+    /** The wording that produced a file, so "try again" can offer a different one. */
+    private var lastUserPrompt: String? = null
+
+    /** Directories whose contents are build output, not things to show. */
+    private val MEDIA_SKIP_DIRS = setOf("out", "dist", "coverage", "cache", "tmp", ".git")
+
+    /** Sends a follow-up about a media file: regenerate, or reword and retry. */
+    fun askAboutMedia(file: File, instruction: String) {
+        val prompt = lastUserPrompt
+        val message = buildString {
+            append(instruction).append(' ').append(file.name)
+            if (prompt != null) append(" (прежний запрос: ").append(prompt).append(')')
+            append(". ")
+            append("Посмотри файл в проекте и сделай новую версию; если не можешь создавать такой файл сам — скажи прямо.")
+        }
+        sendToAgent(message)
+    }
+
+    /** Opens a media file from the chat in the built-in viewer. */
+    fun openMedia(file: File) = showPreview(file)
+
+    /**
+     * Opens the system wallpaper picker at this app's entry.
+     *
+     * The app cannot set a wallpaper itself without the user confirming it in the
+     * system UI, so this only launches that screen; everything after it belongs
+     * to Android.
+     */
+    fun openWallpaperPicker() {
+        val intent = Intent(WallpaperManager.ACTION_CHANGE_LIVE_WALLPAPER).apply {
+            putExtra(
+                "android.service.wallpaper.EXTRA_LIVE_WALLPAPER_COMPONENT",
+                ComponentName(getApplication(), "dev.pocketrun.wallpaper.LiveWallpaperService"),
+            )
+        }
+        if (!startIntent(intent)) {
+            // Not every device or launcher offers the live wallpaper picker.
+            startIntent(Intent(WallpaperManager.ACTION_LIVE_WALLPAPER_CHOOSER))
+        }
+    }
+
+    /** Copies a produced file out of the sandbox to somewhere the user chooses. */
+    fun exportMedia(file: File) {
+        val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = Mime.of(file)
+            putExtra(Intent.EXTRA_TITLE, file.name)
+        }
+        _exportSource.value = file
+        startIntent(intent)
+    }
+
+    private val _exportSource = MutableStateFlow<File?>(null)
+
+    /** Finishes a [exportMedia] hand-off once the system picker returns a target. */
+    fun completeExport(target: Uri) {
+        val source = _exportSource.value ?: return
+        _exportSource.value = null
+        ioExecutor.execute {
+            val ok = runCatching {
+                getApplication<Application>().contentResolver.openOutputStream(target)?.use { out ->
+                    source.inputStream().use { it.copyTo(out) }
+                }
+            }.getOrNull()
+            _agentMessages.update {
+                it + if (ok != null) {
+                    AgentItem.Info("Сохранено: ${source.name}")
+                } else {
+                    AgentItem.Error("Не удалось сохранить ${source.name}")
+                }
+            }
+        }
     }
 
     fun select(project: Project) {
@@ -1467,7 +1615,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     sealed interface FilePreview {
         data object None : FilePreview
         data object Loading : FilePreview
-        data class Image(val bitmap: Bitmap, val name: String) : FilePreview
+        data class Image(val bitmap: Bitmap, val name: String, val file: File? = null) : FilePreview
         data class Audio(val file: File, val mime: String) : FilePreview
         data class Video(val file: File, val mime: String) : FilePreview
         data class Other(val file: File, val size: String) : FilePreview

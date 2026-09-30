@@ -85,7 +85,15 @@ fun FileViewerDialog(preview: AppViewModel.FilePreview, viewModel: AppViewModel)
                 is AppViewModel.FilePreview.Loading -> Centered {
                     CircularProgressIndicator(color = Color.White)
                 }
-                is AppViewModel.FilePreview.Image -> ImageViewer(preview.bitmap, preview.name)
+                // An animation gets a real ImageView: a Bitmap on screen cannot
+                // move, so a GIF decoded to a bitmap here would be frozen forever
+                // with nothing to say so.
+                is AppViewModel.FilePreview.Image ->
+                    if (preview.file != null && isAnimated(preview.file)) {
+                        AnimatedImageViewer(preview.file)
+                    } else {
+                        ImageViewer(preview.bitmap, preview.name)
+                    }
                 is AppViewModel.FilePreview.Audio -> AudioViewer(preview.file)
                 is AppViewModel.FilePreview.Video -> VideoViewer(preview.file)
                 is AppViewModel.FilePreview.Other -> OtherViewer(preview.file, preview.size, viewModel)
@@ -118,6 +126,47 @@ fun FileViewerDialog(preview: AppViewModel.FilePreview, viewModel: AppViewModel)
                 }
             }
         }
+    }
+}
+
+/**
+ * Plays an animated GIF or WebP.
+ *
+ * The drawable drives itself; an ImageView just hosts it, so nothing is allocated
+ * per frame - which is exactly what decoding each frame into a bitmap to hand it
+ * to Compose would do, at twenty times a second.
+ */
+@Composable
+private fun AnimatedImageViewer(file: File) {
+    var failed by remember(file) { mutableStateOf<String?>(null) }
+    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+        AndroidView(
+            modifier = Modifier.fillMaxSize(),
+            factory = { context ->
+                val view = android.widget.ImageView(context).apply {
+                    scaleType = android.widget.ImageView.ScaleType.FIT_CENTER
+                    setBackgroundColor(android.graphics.Color.BLACK)
+                }
+                runCatching {
+                    val source = android.graphics.ImageDecoder.createSource(file)
+                    val drawable = android.graphics.ImageDecoder.decodeDrawable(source)
+                    if (drawable is android.graphics.drawable.AnimatedImageDrawable) {
+                        view.setImageDrawable(drawable)
+                        drawable.start()
+                        view.tag = drawable
+                    } else {
+                        view.setImageDrawable(drawable)
+                    }
+                }.onFailure {
+                    failed = "анимация не открылась: ${it.message}"
+                }
+                view
+            },
+            onRelease = { view ->
+                (view.tag as? android.graphics.drawable.AnimatedImageDrawable)?.stop()
+            },
+        )
+        failed?.let { Text(it, color = Color.White, modifier = Modifier.padding(24.dp)) }
     }
 }
 

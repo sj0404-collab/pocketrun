@@ -27,6 +27,22 @@
             </intent-filter>
         </activity>
 
+        <!-- The live wallpaper the app offers. BIND_WALLPAPER is what the system
+             grants to exactly one app chosen by the user; nothing else is opened
+             and no permission is taken. -->
+        <service
+            android:name=".wallpaper.LiveWallpaperService"
+            android:exported="true"
+            android:label="@string/live_wallpaper_label"
+            android:permission="android.permission.BIND_WALLPAPER">
+            <intent-filter>
+                <action android:name="android.service.wallpaper.WallpaperService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.service.wallpaper"
+                android:resource="@xml/live_wallpaper" />
+        </service>
+
         <!-- Hands a downloaded update to the installer; grants nothing else. -->
         <provider
             android:name="androidx.core.content.FileProvider"
