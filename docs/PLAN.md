@@ -184,8 +184,15 @@ tools/keygen/                         отдельный JVM-проект: genke
 * `assets/node/boot.js` — `require` (relative/json/`node_modules`/`packages/`,
   `__dirname`, `__setMainDir` для главного скрипта), `module.exports`,
   `path`, `process`, `console`, `os`, `util`, `events`, `url`/`querystring`,
-  `http(s)` (синхронный через мост, фейк-асинхронный API), `assert`, `stream`,
-  таймеры, `Buffer` (utf8/base64/hex, кириллица), полифилл `Promise`;
+  `http(s)` (синхронный через мост, фейк-асинхронный API), `assert`,
+  `stream` (Readable/Writable/Duplex/Transform/PassThrough с буферизацией,
+  `pipe`, `drain`/`finish`/`end`), таймеры, `Buffer` (utf8/base64/hex,
+  кириллица), полифилл `Promise`;
+* `os`/`process` отдают живые данные устройства через мост
+  (`core/SystemInfo.kt`): `arch`/`release`/`hostname`/`cpus`/`totalmem`/
+  `freemem`/`uptime`/`loadavg`/`networkInterfaces` (из `/proc` и `java.net`),
+  `process.memoryUsage()`/`hrtime()`/`pid`; `fs.createReadStream` и
+  `fs.createWriteStream` — настоящие потоки, а не заглушки;
   шебанг и `async function` срезаются при загрузке модулей;
 * песочница fs целиком на стороне моста (`Workspace.resolve`), выход за
   корень = ENOENT/EACCES;

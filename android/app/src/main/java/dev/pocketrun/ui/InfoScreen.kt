@@ -1,5 +1,6 @@
 package dev.pocketrun.ui
 
+import android.os.Build
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -57,7 +58,7 @@ fun InfoScreen(viewModel: AppViewModel, license: LicenseManager.LicenseState.Act
         SectionCard("Сборка") {
             InfoRow("Версия", BuildConfig.VERSION_NAME ?: "-")
             InfoRow("versionCode", BuildConfig.VERSION_CODE.toString())
-            InfoRow("Python ABI", "arm64-v8a, x86_64")
+            InfoRow("Python ABI", Build.SUPPORTED_ABIS?.joinToString(", ")?.takeIf { it.isNotBlank() } ?: "неизвестно")
         }
 
         SectionCard("Агент") {

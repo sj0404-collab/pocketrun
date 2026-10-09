@@ -336,6 +336,98 @@ class JsRuntimeTest {
         assertEquals("len=12", lines[3])
     }
 
+    // ---------------------------------------------------------------- native os/process
+
+    @Test
+    fun osAndProcessExposeLiveNativeValues() {
+        val workspace = Workspace.at(tmp.newFolder())
+        val result = run(
+            workspace,
+            """
+            var os = require('os');
+            console.log('arch=' + os.arch());
+            console.log('type=' + os.type());
+            console.log('release=' + os.release().length);
+            console.log('hostname=' + (os.hostname().length > 0));
+            console.log('cpus=' + os.cpus().length);
+            console.log('totalmem=' + (os.totalmem() > 0));
+            console.log('freemem=' + (os.freemem() > 0));
+            console.log('uptime=' + (os.uptime() > 0));
+            console.log('loadavg=' + os.loadavg().length);
+            console.log('ifaces=' + Object.keys(os.networkInterfaces()).length);
+            console.log('pid=' + (process.pid > 0));
+            console.log('heapTotal=' + (process.memoryUsage().heapTotal > 0));
+            var t = process.hrtime();
+            console.log('hrtime=' + (t.length === 2 && typeof t[1] === 'number'));
+            """.trimIndent(),
+        )
+        assertEquals("stderr: ${result.stderr}", 0, result.exitCode)
+        val out = result.stdout
+        // The old stubs returned 0/[]/{} for these. On the Linux test host the
+        // real /proc-backed values are non-zero and populated.
+        assertTrue("arch: $out", Regex("arch=\\S+").containsMatchIn(out))
+        assertTrue("type: $out", out.contains("type=Linux"))
+        assertTrue("release: $out", Regex("release=[1-9]").containsMatchIn(out))
+        assertTrue("hostname: $out", out.contains("hostname=true"))
+        assertTrue("cpus: $out", Regex("cpus=[1-9]").containsMatchIn(out))
+        assertTrue("totalmem: $out", out.contains("totalmem=true"))
+        assertTrue("freemem: $out", out.contains("freemem=true"))
+        assertTrue("uptime: $out", out.contains("uptime=true"))
+        assertTrue("loadavg: $out", out.contains("loadavg=3"))
+        assertTrue("ifaces: $out", Regex("ifaces=[1-9]").containsMatchIn(out))
+        assertTrue("pid: $out", out.contains("pid=true"))
+        assertTrue("heapTotal: $out", out.contains("heapTotal=true"))
+        assertTrue("hrtime: $out", out.contains("hrtime=true"))
+    }
+
+    @Test
+    fun fsStreamsAndStreamModuleRoundTrip() {
+        val workspace = Workspace.at(tmp.newFolder())
+        val result = run(
+            workspace,
+            """
+            var fs = require('fs');
+            var stream = require('stream');
+            var ws = fs.createWriteStream('out.txt');
+            ws.on('finish', function () {
+              var rs = fs.createReadStream('out.txt');
+              var got = '';
+              rs.on('data', function (c) { got += c.toString(); });
+              rs.on('end', function () {
+                console.log('read=' + got);
+                var pt = new stream.PassThrough();
+                var acc = '';
+                pt.on('data', function (c) { acc += c.toString(); });
+                pt.on('end', function () {
+                  console.log('through=' + acc);
+                  var tr = new stream.Transform({
+                    transform: function (chunk, enc, cb) { cb(null, chunk.toString().toUpperCase()); },
+                  });
+                  var up = '';
+                  tr.on('data', function (c) { up += c.toString(); });
+                  tr.on('end', function () {
+                    console.log('upper=' + up);
+                    fs.createReadStream('out.txt').pipe(fs.createWriteStream('copy.txt'));
+                  });
+                  tr.write('abc');
+                  tr.end('def');
+                });
+                pt.write('abc');
+                pt.end('def');
+              });
+            });
+            ws.write('hello ');
+            ws.end('world');
+            """.trimIndent(),
+        )
+        assertEquals("stderr: ${result.stderr}", 0, result.exitCode)
+        val out = result.stdout
+        assertTrue("stdout: $out", out.contains("read=hello world"))
+        assertTrue("stdout: $out", out.contains("through=abcdef"))
+        assertTrue("stdout: $out", out.contains("upper=ABCDEF"))
+        assertEquals("hello world", File(workspace.root, "copy.txt").readText())
+    }
+
     @Test
     fun runtimeErrorReportsLineAndExitCode() {
         val workspace = Workspace.at(tmp.newFolder())

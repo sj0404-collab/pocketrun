@@ -1,6 +1,7 @@
 package dev.pocketrun.runtime.js
 
 import android.util.Log
+import dev.pocketrun.core.SystemInfo
 import dev.pocketrun.core.Workspace
 import dev.pocketrun.runtime.ExecRequest
 import dev.pocketrun.runtime.ExecResult
@@ -15,6 +16,7 @@ import org.mozilla.javascript.RhinoException
 import org.mozilla.javascript.Scriptable
 import org.mozilla.javascript.ScriptableObject
 import org.mozilla.javascript.Undefined
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
@@ -277,6 +279,13 @@ class JsRuntime(
         method("root") { workspace.root.absolutePath }
         method("now") { System.currentTimeMillis().toDouble() }
 
+        // Native process/OS facts for the boot.js os and process modules. The
+        // static half is read once, the volatile half on every call.
+        method("sysinfo") { systemInfoJson() }
+        method("sysstat") { systemStatJson() }
+        method("memoryUsage") { memoryUsageJson() }
+        method("hrtime") { SystemInfo.hrtimeNanos().toDouble() }
+
         method("print") { a -> str(a, 0)?.let { writeOut(state, it) } }
         method("printErr") { a -> str(a, 0)?.let { writeErr(state, it) } }
 
@@ -388,6 +397,73 @@ class JsRuntime(
             state.errWriter.write(text)
             state.errWriter.flush()
         } catch (t: Throwable) { Log.w(TAG, "stderr write failed", t) }
+    }
+
+    /** Static hardware facts for `os.*` / `process.arch` / `process.pid`. */
+    private fun systemInfoJson(): String {
+        val cpus = JSONArray()
+        for (cpu in SystemInfo.cpus()) {
+            cpus.put(
+                JSONObject()
+                    .put("model", cpu.model)
+                    .put("speed", cpu.speedMhz)
+                    .put(
+                        "times",
+                        JSONObject()
+                            .put("user", cpu.times.user)
+                            .put("nice", cpu.times.nice)
+                            .put("sys", cpu.times.sys)
+                            .put("idle", cpu.times.idle)
+                            .put("irq", cpu.times.irq),
+                    ),
+            )
+        }
+        val interfaces = JSONObject()
+        for ((name, addresses) in SystemInfo.networkInterfaces()) {
+            val list = JSONArray()
+            for (address in addresses) {
+                list.put(
+                    JSONObject()
+                        .put("address", address.address)
+                        .put("family", address.family)
+                        .put("mac", address.mac)
+                        .put("internal", address.internal),
+                )
+            }
+            interfaces.put(name, list)
+        }
+        return JSONObject()
+            .put("arch", SystemInfo.arch)
+            .put("abi", SystemInfo.abi)
+            .put("release", SystemInfo.release)
+            .put("hostname", SystemInfo.hostname)
+            .put("totalmem", SystemInfo.totalMemory)
+            .put("pid", SystemInfo.pid)
+            .put("cpus", cpus)
+            .put("networkInterfaces", interfaces)
+            .toString()
+    }
+
+    /** Volatile counters that must not be cached: uptime, free memory, load. */
+    private fun systemStatJson(): String {
+        val load = JSONArray()
+        SystemInfo.loadAverage.forEach { load.put(it) }
+        return JSONObject()
+            .put("uptime", SystemInfo.uptimeSeconds)
+            .put("freemem", SystemInfo.freeMemory)
+            .put("loadavg", load)
+            .toString()
+    }
+
+    private fun memoryUsageJson(): String {
+        val usage = SystemInfo.memoryUsage()
+        return JSONObject()
+            .put("rss", usage.rss)
+            .put("heapTotal", usage.heapTotal)
+            .put("heapUsed", usage.heapUsed)
+            .put("external", usage.external)
+            .put("arrayBuffers", usage.arrayBuffers)
+            .toString()
     }
 
     /**

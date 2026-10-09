@@ -103,13 +103,49 @@
     this.emit = function () { return false; };
   }
 
+  // Native process / OS facts come from the JsRuntime bridge. The static half
+  // (arch, CPU list, memory size, interfaces) is fetched once; the volatile half
+  // (uptime, free memory, load) is re-read on every call, like real Node.
+  var cachedSysInfo = null;
+  function sysInfo() {
+    if (cachedSysInfo === null) {
+      try { cachedSysInfo = JSON.parse(bridge.sysinfo()) || {}; }
+      catch (e) { cachedSysInfo = {}; }
+    }
+    return cachedSysInfo;
+  }
+  function sysStat() {
+    try { return JSON.parse(bridge.sysstat()) || {}; } catch (e) { return {}; }
+  }
+  function osUptime() {
+    var v = sysStat().uptime;
+    return typeof v === 'number' ? v : 0;
+  }
+  function osFreemem() {
+    var v = sysStat().freemem;
+    return typeof v === 'number' ? v : 0;
+  }
+  function osLoadavg() {
+    var v = sysStat().loadavg;
+    return (v && v.length === 3) ? v : [0, 0, 0];
+  }
+  function osMemoryUsage() {
+    try {
+      var m = JSON.parse(bridge.memoryUsage()) || {};
+      return {
+        rss: m.rss || 0, heapTotal: m.heapTotal || 0, heapUsed: m.heapUsed || 0,
+        external: m.external || 0, arrayBuffers: m.arrayBuffers || 0,
+      };
+    } catch (e) { return { rss: 0, heapTotal: 0, heapUsed: 0, external: 0, arrayBuffers: 0 }; }
+  }
+
   var process = {
     argv: argv,
     env: env,
     platform: 'android',
-    arch: 'arm64',
+    arch: sysInfo().arch || 'unknown',
     title: 'node',
-    pid: 1,
+    pid: sysInfo().pid || 1,
     version: 'v18.16.0',
     versions: { node: '18.16.0', pocketrun: '1.0' },
     execPath: '/usr/local/bin/node',
@@ -125,9 +161,17 @@
     on: function (ev, fn) { if (ev === 'exit') { exitHandlers.push(fn); } return process; },
     once: function (ev, fn) { return process.on(ev, fn); },
     removeAllListeners: function () { return process; },
-    hrtime: function () { return [Math.floor(bridge.now() / 1000), (bridge.now() % 1000) * 1e6]; },
-    memoryUsage: function () { return { rss: 0, heapTotal: 0, heapUsed: 0, external: 0 }; },
-    uptime: function () { return 0; },
+    hrtime: function (prev) {
+      var now = bridge.hrtime();
+      if (prev && prev.length) {
+        var delta = now - (prev[0] * 1e9 + prev[1]);
+        if (delta < 0) { delta = 0; }
+        return [Math.floor(delta / 1e9), delta % 1e9];
+      }
+      return [Math.floor(now / 1e9), now % 1e9];
+    },
+    memoryUsage: osMemoryUsage,
+    uptime: osUptime,
   };
 
   // ---------------------------------------------------------------- util
@@ -629,8 +673,53 @@
       unlink: fakeAsync(unlinkSync), rename: fakeAsync(renameSync),
       access: fakeAsync(accessSync), exists: function (p, cb) { setImmediate(function () { cb(existsSync(p)); }); },
       constants: { F_OK: 0, R_OK: 4, W_OK: 2, X_OK: 1 },
-      createReadStream: function () { throw err('fs.createReadStream is not supported in PocketRun'); },
-      createWriteStream: function () { throw err('fs.createWriteStream is not supported in PocketRun'); },
+      createReadStream: function (p, opts) {
+        opts = opts || {};
+        var r = new builtins.stream.Readable();
+        var resolved = path.resolve(p);
+        setImmediate(function () {
+          try {
+            if (!bridge.fsExists(resolved) || bridge.fsIsDir(resolved)) {
+              r.emit('error', enoent('open', p));
+              return;
+            }
+            var data = bridge.fsRead(resolved);
+            if (data === null) { r.emit('error', err("cannot read '" + p + "'")); return; }
+            var buf = Buffer.from(data, opts.encoding || 'utf8');
+            var hwm = opts.highWaterMark || 64 * 1024;
+            var pos = opts.start || 0;
+            var end = (opts.end === undefined) ? buf.length : Math.min(opts.end + 1, buf.length);
+            function pump() {
+              if (pos >= end) { r.push(null); return; }
+              var next = Math.min(pos + hwm, end);
+              var chunk = buf.slice(pos, next);
+              pos = next;
+              r.push(chunk);
+              if (!r._readableState.ended) { setImmediate(pump); }
+            }
+            r.emit('open', resolved);
+            pump();
+          } catch (e) { r.emit('error', e); }
+        });
+        return r;
+      },
+      createWriteStream: function (p, opts) {
+        opts = opts || {};
+        var resolved = path.resolve(p);
+        var append = (opts.flags || 'w').indexOf('a') >= 0;
+        if (!append) { bridge.fsWrite(resolved, ''); }
+        var w = new builtins.stream.Writable({
+          write: function (chunk, encoding, cb) {
+            try {
+              var text = Buffer.isBuffer(chunk) ? chunk.toString(encoding || 'utf8') : String(chunk);
+              if (bridge.fsAppend(resolved, text)) { cb(); } else { cb(err("cannot write '" + p + "'")); }
+            } catch (e) { cb(e); }
+          },
+        });
+        w.path = resolved;
+        setImmediate(function () { w.emit('open', resolved); });
+        return w;
+      },
     };
   })();
 
@@ -728,19 +817,19 @@
 
   var os = {
     platform: function () { return 'android'; },
-    arch: function () { return 'arm64'; },
+    arch: function () { return sysInfo().arch || 'unknown'; },
     type: function () { return 'Linux'; },
-    release: function () { return ''; },
-    hostname: function () { return 'localhost'; },
+    release: function () { return sysInfo().release || ''; },
+    hostname: function () { return sysInfo().hostname || 'localhost'; },
     homedir: function () { return ROOT; },
     tmpdir: function () { return path.join(ROOT, 'cache', 'tmp'); },
     EOL: '\n',
-    cpus: function () { return []; },
-    totalmem: function () { return 0; },
-    freemem: function () { return 0; },
-    uptime: function () { return 0; },
-    loadavg: function () { return [0, 0, 0]; },
-    networkInterfaces: function () { return {}; },
+    cpus: function () { return sysInfo().cpus || []; },
+    totalmem: function () { return sysInfo().totalmem || 0; },
+    freemem: osFreemem,
+    uptime: osUptime,
+    loadavg: osLoadavg,
+    networkInterfaces: function () { return sysInfo().networkInterfaces || {}; },
   };
 
   // ---------------------------------------------------------------- http / https
@@ -935,20 +1024,232 @@
     stream: (function () {
       function Stream() { EventEmitter.call(this); }
       util.inherits(Stream, EventEmitter);
-      Stream.prototype.pipe = function () { return this; };
-      function Writable() { Stream.call(this); }
+      Stream.prototype.pipe = function (dest) {
+        this.on('data', function (chunk) { dest.write(chunk); });
+        this.on('end', function () { dest.end(); });
+        return dest;
+      };
+
+      function toBuffer(chunk, encoding) {
+        if (Buffer.isBuffer(chunk)) { return chunk; }
+        return Buffer.from(String(chunk), encoding || 'utf8');
+      }
+
+      // ------------------------------------------------------------ Writable
+      function Writable(opts) {
+        Stream.call(this);
+        this._writableState = {
+          ended: false, finished: false, writing: false,
+          defaultEncoding: (opts && opts.defaultEncoding) || 'utf8',
+        };
+        if (opts && typeof opts.write === 'function') { this._write = opts.write; }
+        if (opts && typeof opts.final === 'function') { this._final = opts.final; }
+      }
       util.inherits(Writable, Stream);
-      Writable.prototype.write = function (c, e, cb) { var fn = typeof e === 'function' ? e : cb; if (fn) { fn(); } this.emit('drain'); return true; };
-      Writable.prototype.end = function (c, e, cb) { var fn = typeof e === 'function' ? e : cb; this.emit('finish'); if (fn) { fn(); } return this; };
-      function Readable() { Stream.call(this); }
+      Writable.prototype._write = function (chunk, encoding, cb) { cb(); };
+      Writable.prototype._final = function (cb) { cb(); };
+      Writable.prototype.write = function (chunk, encoding, cb) {
+        if (typeof encoding === 'function') { cb = encoding; encoding = undefined; }
+        var state = this._writableState;
+        if (state.ended) {
+          var afterEnd = new Error('write after end');
+          if (cb) { setImmediate(function () { cb(afterEnd); }); }
+          return false;
+        }
+        var self = this;
+        var called = false;
+        state.writing = true;
+        this._write(toBuffer(chunk, encoding), encoding || state.defaultEncoding, function (err) {
+          if (called) { return; }
+          called = true;
+          state.writing = false;
+          if (cb) { cb(err); }
+          if (err) { self.emit('error', err); return; }
+          self.emit('drain');
+        });
+        return true;
+      };
+      Writable.prototype.end = function (chunk, encoding, cb) {
+        if (typeof chunk === 'function') { cb = chunk; chunk = undefined; encoding = undefined; }
+        else if (typeof encoding === 'function') { cb = encoding; encoding = undefined; }
+        var self = this;
+        var state = this._writableState;
+        function finalize() {
+          if (state.ended) { return; }
+          state.ended = true;
+          self._final(function (err) {
+            state.finished = true;
+            if (err) { self.emit('error', err); }
+            if (cb) { cb(err); }
+            self.emit('finish');
+            self.emit('close');
+          });
+        }
+        if (chunk !== undefined && chunk !== null) {
+          this.write(chunk, encoding, function () { finalize(); });
+        } else {
+          finalize();
+        }
+        return this;
+      };
+      Writable.prototype.cork = function () {};
+      Writable.prototype.uncork = function () {};
+      Writable.prototype.setDefaultEncoding = function (enc) { this._writableState.defaultEncoding = enc; return this; };
+      Writable.prototype.destroy = function (err) { if (err) { this.emit('error', err); } this.emit('close'); return this; };
+
+      // ------------------------------------------------------------ Readable
+      function Readable(opts) {
+        Stream.call(this);
+        this._readableState = {
+          buffer: [], ended: false, flowing: false,
+          encoding: null, emittedEnd: false, pending: false,
+        };
+        if (opts && typeof opts.read === 'function') { this._read = opts.read; }
+        if (opts && typeof opts.destroy === 'function') { this._destroy = opts.destroy; }
+      }
       util.inherits(Readable, Stream);
-      Readable.prototype.push = function (d) { if (d !== null) { this.emit('data', Buffer.isBuffer(d) ? d : Buffer.from(String(d))); } return true; };
-      function Duplex() { Writable.call(this); Readable.call(this); }
+      Readable.prototype._read = function () {};
+      Readable.prototype._destroy = function (err, cb) { cb(err); };
+      Readable.prototype.push = function (chunk, encoding) {
+        var state = this._readableState;
+        if (chunk === null || chunk === undefined) {
+          state.ended = true;
+          this._drainReadable();
+          return false;
+        }
+        state.buffer.push(toBuffer(chunk, encoding || state.encoding));
+        if (state.flowing) { this._drainReadable(); }
+        return true;
+      };
+      Readable.prototype.unshift = function (chunk) {
+        this._readableState.buffer.unshift(toBuffer(chunk));
+        return true;
+      };
+      Readable.prototype.read = function () {
+        var state = this._readableState;
+        if (state.buffer.length > 0) {
+          var buf = state.buffer.shift();
+          this._drainReadable();
+          return state.encoding ? buf.toString(state.encoding) : buf;
+        }
+        this._read(state.buffer.length);
+        if (state.buffer.length > 0) { return this.read(); }
+        return null;
+      };
+      Readable.prototype.on = function (ev, fn) {
+        var result = Stream.prototype.on.call(this, ev, fn);
+        if (ev === 'data' || ev === 'readable') { this.resume(); }
+        return result;
+      };
+      Readable.prototype.resume = function () {
+        this._readableState.flowing = true;
+        var self = this;
+        setImmediate(function () { self._drainReadable(); });
+        this.emit('resume');
+        return this;
+      };
+      Readable.prototype.pause = function () {
+        this._readableState.flowing = false;
+        this.emit('pause');
+        return this;
+      };
+      Readable.prototype.isPaused = function () { return !this._readableState.flowing; };
+      Readable.prototype.setEncoding = function (enc) { this._readableState.encoding = enc; return this; };
+      Readable.prototype._drainReadable = function () {
+        var state = this._readableState;
+        if (state.pending) { return; }
+        state.pending = true;
+        var self = this;
+        setImmediate(function () {
+          state.pending = false;
+          if (!state.flowing) { return; }
+          while (state.flowing && state.buffer.length > 0) {
+            var buf = state.buffer.shift();
+            self.emit('data', state.encoding ? buf.toString(state.encoding) : buf);
+          }
+          if (state.flowing && !state.ended && state.buffer.length === 0) { self._read(0); }
+          self._maybeEnd();
+        });
+      };
+      Readable.prototype._maybeEnd = function () {
+        var state = this._readableState;
+        if (state.ended && state.buffer.length === 0 && !state.emittedEnd) {
+          state.emittedEnd = true;
+          this.emit('end');
+          this.emit('close');
+        }
+      };
+      Readable.prototype.pipe = function (dest, opts) {
+        var self = this;
+        this.on('data', function (chunk) {
+          if (dest.write(chunk) === false) {
+            self.pause();
+            dest.once('drain', function () { self.resume(); });
+          }
+        });
+        this.on('end', function () { if (!(opts && opts.end === false)) { dest.end(); } });
+        this.on('error', function (e) { if (dest.emit) { dest.emit('error', e); } });
+        return dest;
+      };
+      Readable.prototype.unpipe = function () { return this; };
+      Readable.prototype.destroy = function (err) {
+        this._readableState.ended = true;
+        this._destroy(err, function () {});
+        if (err) { this.emit('error', err); }
+        this.emit('close');
+        return this;
+      };
+      Readable.prototype.wrap = function () { return this; };
+
+      function copyReadableMethods(proto) {
+        Object.getOwnPropertyNames(Readable.prototype).forEach(function (key) {
+          if (key !== 'constructor') { proto[key] = Readable.prototype[key]; }
+        });
+      }
+
+      // ------------------------------------------------------------ Duplex / Transform
+      function Duplex(opts) {
+        Writable.call(this, opts);
+        Readable.call(this, opts);
+      }
       util.inherits(Duplex, Writable);
-      function Transform() { Duplex.call(this); }
+      copyReadableMethods(Duplex.prototype);
+      Duplex.prototype._read = function () {};
+
+      function Transform(opts) {
+        Duplex.call(this, opts);
+        if (opts && typeof opts.transform === 'function') { this._transform = opts.transform; }
+        if (opts && typeof opts.flush === 'function') { this._flushTransform = opts.flush; }
+      }
       util.inherits(Transform, Duplex);
-      Transform.prototype._transform = function () {};
-      return { Stream: Stream, Writable: Writable, Readable: Readable, Duplex: Duplex, Transform: Transform, PassThrough: Transform };
+      Transform.prototype._transform = function (chunk, encoding, cb) { cb(null, chunk); };
+      Transform.prototype._write = function (chunk, encoding, cb) {
+        var self = this;
+        this._transform(chunk, encoding, function (err, out) {
+          if (err) { return cb(err); }
+          if (out !== undefined && out !== null && out !== false) { self.push(out); }
+          cb();
+        });
+      };
+      Transform.prototype._final = function (cb) {
+        var self = this;
+        function finish(err, out) {
+          if (out !== undefined && out !== null) { self.push(out); }
+          self.push(null);
+          cb(err);
+        }
+        if (typeof this._flushTransform !== 'function') { return finish(); }
+        this._flushTransform(function (err, out) { finish(err, out); });
+      };
+
+      function PassThrough(opts) { Transform.call(this, opts); }
+      util.inherits(PassThrough, Transform);
+      PassThrough.prototype._transform = function (chunk, encoding, cb) { cb(null, chunk); };
+
+      return {
+        Stream: Stream, Writable: Writable, Readable: Readable,
+        Duplex: Duplex, Transform: Transform, PassThrough: PassThrough,
+      };
     })(),
   };
 
