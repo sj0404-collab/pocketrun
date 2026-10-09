@@ -3,6 +3,7 @@ package dev.pocketrun.agent.opencode
 import dev.pocketrun.core.Workspace
 import dev.pocketrun.runtime.SyncScriptRuntime
 import dev.pocketrun.runtime.npm.NpxRuntime
+import dev.pocketrun.runtime.shell.Busybox
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -21,6 +22,7 @@ class OpenCodeTools(
     npxRuntime: NpxRuntime,
     private val projectDir: File?,
     private val githubToken: String = "",
+    busybox: Busybox? = null,
 ) {
 
     companion object {
@@ -32,7 +34,7 @@ class OpenCodeTools(
         const val BASH_TIMEOUT_MS = 300_000L
     }
 
-    private val shell = MiniShell(workspace, jsRuntime, npxRuntime)
+    private val shell = MiniShell(workspace, jsRuntime, npxRuntime, busybox)
     private val skills = Skills(workspace)
 
     /** Answers pending questions; set by the agent runner. */

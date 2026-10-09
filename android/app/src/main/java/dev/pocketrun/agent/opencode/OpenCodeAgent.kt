@@ -225,6 +225,7 @@ class OpenCodeAgent(
             appendLine("  - `node` runs real Node.js 18 (nodejs-mobile): require, async/await, class and the standard library all work;")
             appendLine("  - `npx <pkg> [args]` installs and runs npm packages (pure-JS only; native addons are skipped);")
             appendLine("  - `npm init -y`, `npm install <pkg>`, `npm run <script>`, `npm ls` manage a real node project: package.json is created in the project, installed packages are visible to require(), scripts run through the shell. Pure-JS packages only (no native addons).")
+            appendLine("  - any real BusyBox utility also works (sed, awk, sort, uniq, cut, tr, tar, gzip, xargs, diff, wget, ...); these run as real native binaries and are NOT restricted to the workspace.")
             appendLine("  - commands may run up to ${OpenCodeTools.BASH_TIMEOUT_MS / 60_000} minutes each; `sleep` up to ${MiniShell.MAX_SLEEP_SECONDS} seconds.")
             appendLine("- `webfetch` can read documentation pages.")
             appendLine()

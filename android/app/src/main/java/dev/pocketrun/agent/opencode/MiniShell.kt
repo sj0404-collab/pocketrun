@@ -6,6 +6,7 @@ import dev.pocketrun.runtime.RuntimeKind
 import dev.pocketrun.runtime.SyncScriptRuntime
 import dev.pocketrun.runtime.npm.NpxRuntime
 import dev.pocketrun.runtime.python.PythonRuntime
+import dev.pocketrun.runtime.shell.Busybox
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -24,6 +25,7 @@ class MiniShell(
     private val workspace: Workspace,
     private val jsRuntime: SyncScriptRuntime,
     private val npxRuntime: NpxRuntime,
+    private val busybox: Busybox? = null,
 ) {
 
     companion object {
@@ -32,6 +34,9 @@ class MiniShell(
 
         /** `sleep` in the sandbox: long enough to wait for a job, short enough not to hang a turn. */
         const val MAX_SLEEP_SECONDS = 120f
+
+        /** Native BusyBox applets (sed, tar, ...) may take a while. */
+        const val BUSYBOX_TIMEOUT_MS = 120_000L
         val COMMANDS = listOf(
             "cat", "cd", "cp", "date", "echo", "env", "false", "find", "grep", "head",
             "ls", "mkdir", "mv", "node", "npm", "npx", "pwd", "python", "rm", "sleep", "tail",
@@ -46,6 +51,8 @@ class MiniShell(
                                                    — управление node-проектом (install качает
                                                      чистые JS-пакеты; require() их видит)
             sleep <секунды>                       — пауза (максимум ${MAX_SLEEP_SECONDS.toInt()} с)
+            Любой applet BusyBox (sed, awk, sort, uniq, cut, tr, tar, gzip,
+            xargs, diff, wget, ...) выполняется как настоящий бинарник.
             Поддерживаются кавычки, && , | и > >> для встроенных команд.
         """.trimIndent()
     }
@@ -206,12 +213,35 @@ class MiniShell(
                 Result(0, "")
             }
             "uname" -> Result(0, "Linux aarch64 PocketRun\n")
-            "which" -> Result(if (args.firstOrNull() in COMMANDS) 0 else 1, if (args.firstOrNull() in COMMANDS) "/bin/${args.first()}\n" else "")
+            "which" -> {
+                val name = args.firstOrNull()
+                when {
+                    name == null -> Result(1, "")
+                    name in COMMANDS -> Result(0, "/bin/$name\n")
+                    busybox?.knowsApplet(name) == true -> Result(0, "${busybox.binaryPath} $name\n")
+                    else -> Result(1, "")
+                }
+            }
             "true" -> Result(0, "")
             "false" -> Result(1, "")
             "help" -> Result(0, HELP + "\n")
-            else -> Result(127, "bash: $cmd: команда не найдена (доступно: ${COMMANDS.joinToString(", ")})\n")
+            else -> runExternal(cmd, args, dir, stdin)
         }
+    }
+
+    /** Falls back to a real BusyBox applet for anything the built-ins lack. */
+    private fun runExternal(cmd: String, args: List<String>, dir: File, stdin: String): Result {
+        val bb = busybox
+        if (bb != null && bb.isAvailable() && bb.knowsApplet(cmd)) {
+            val r = bb.run(listOf(cmd) + args, dir, stdin, BUSYBOX_TIMEOUT_MS)
+            return Result(r.exitCode, r.stdout + (if (r.stderr.isNotBlank()) r.stderr else ""))
+        }
+        val hint = if (bb != null && bb.isAvailable()) {
+            " (встроенные: ${COMMANDS.joinToString(", ")}; плюс любой applet busybox)"
+        } else {
+            " (доступно: ${COMMANDS.joinToString(", ")})"
+        }
+        return Result(127, "bash: $cmd: команда не найдена$hint\n")
     }
 
     private fun flagsFree(args: List<String>): List<String> = args.filter { !it.startsWith("-") }

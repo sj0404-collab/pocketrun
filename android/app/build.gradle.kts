@@ -1,5 +1,6 @@
 import org.gradle.api.GradleException
 import java.net.URI
+import java.security.MessageDigest
 import java.util.Properties
 import java.util.zip.ZipInputStream
 
@@ -163,7 +164,69 @@ val assembleNodeJniLibs by tasks.registering {
     }
 }
 
-tasks.matching { it.name == "preBuild" }.configureEach { dependsOn(assembleNodeJniLibs) }
+// ---------------------------------------------------------------------------
+// BusyBox
+//
+// meefik's Android build (F-Droid) ships per-ABI `libbusybox.so`: a real,
+// statically linked BusyBox compiled for Android. We stage it in jniLibs so
+// Android extracts it to nativeLibraryDir and the mini-shell can exec applets
+// (sed, awk, sort, tar, xargs, wget, ...).
+// ---------------------------------------------------------------------------
+
+val busyboxVersion = "1.34.1"
+val busyboxApkName = "busybox-v1_34_1-52.apk"
+val busyboxUrl =
+    "https://github.com/meefik/busybox/releases/download/$busyboxVersion/$busyboxApkName"
+val busyboxSha256 = "5972cc9ca5c36f789898f276d3c58a52d72583a7de14e7b3389cce087f45954c"
+val busyboxDir: File = rootProject.file(".busybox")
+val busyboxApk = File(busyboxDir, busyboxApkName)
+val busyboxJniLibs = File(busyboxDir, "jniLibs")
+val busyboxMarker = File(busyboxDir, ".unpacked-$busyboxVersion")
+
+val fetchBusybox by tasks.registering {
+    description = "Downloads Android BusyBox $busyboxVersion and stages per-ABI libbusybox.so."
+    inputs.property("version", busyboxVersion)
+    outputs.file(busyboxMarker)
+    doLast {
+        busyboxDir.mkdirs()
+        if (!busyboxApk.isFile) {
+            logger.lifecycle("PocketRun: downloading BusyBox $busyboxVersion from $busyboxUrl")
+            val tmp = File(busyboxDir, "download.part")
+            URI(busyboxUrl).toURL().openStream().use { input ->
+                tmp.outputStream().use { out -> input.copyTo(out) }
+            }
+            tmp.renameTo(busyboxApk)
+        }
+        val actual = MessageDigest.getInstance("SHA-256")
+            .digest(busyboxApk.readBytes())
+            .joinToString("") { "%02x".format(it) }
+        if (actual != busyboxSha256) {
+            busyboxApk.delete()
+            throw GradleException("busybox: sha256 mismatch (got $actual); download deleted")
+        }
+        if (!busyboxMarker.isFile) {
+            busyboxJniLibs.deleteRecursively()
+            ZipInputStream(busyboxApk.inputStream().buffered()).use { zin ->
+                var entry = zin.nextEntry
+                while (entry != null) {
+                    val abi = nodeMobileAbis.firstOrNull { entry.name == "lib/$it/libbusybox.so" }
+                    if (abi != null && !entry.isDirectory) {
+                        val dest = File(busyboxJniLibs, "$abi/libbusybox.so")
+                        dest.parentFile?.mkdirs()
+                        dest.outputStream().use { out -> zin.copyTo(out) }
+                    }
+                    zin.closeEntry()
+                    entry = zin.nextEntry
+                }
+            }
+            busyboxMarker.writeText(busyboxVersion)
+        }
+    }
+}
+
+tasks.matching { it.name == "preBuild" }.configureEach {
+    dependsOn(assembleNodeJniLibs, fetchBusybox)
+}
 
 android {
     namespace = "dev.pocketrun"
@@ -171,6 +234,7 @@ android {
     ndkVersion = "27.3.13750724"
 
     sourceSets["main"].jniLibs.srcDir(nodeMobileJniLibs)
+    sourceSets["main"].jniLibs.srcDir(busyboxJniLibs)
 
     defaultConfig {
         applicationId = "dev.pocketrun"

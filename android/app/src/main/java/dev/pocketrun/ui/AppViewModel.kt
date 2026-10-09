@@ -38,6 +38,7 @@ import dev.pocketrun.runtime.js.JsRuntime
 import dev.pocketrun.runtime.js.NodeRuntime
 import dev.pocketrun.runtime.npm.NpxRuntime
 import dev.pocketrun.runtime.python.PythonRuntime
+import dev.pocketrun.runtime.shell.Busybox
 import dev.pocketrun.update.AppUpdate
 import dev.pocketrun.update.AppUpdater
 import dev.pocketrun.update.ReleaseInfo
@@ -193,10 +194,16 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         JsRuntime(boot, workspace)
     }
 
-    /** Real Node 18 (nodejs-mobile) when its native launcher is packaged. */
-    val nodeRuntime: NodeRuntime by lazy {
-        NodeRuntime(File(getApplication<Application>().applicationInfo.nativeLibraryDir), workspace)
+    /** Extracted native libs live here on Android (empty in JVM unit tests). */
+    val nativeLibraryDir: File by lazy {
+        File(getApplication<Application>().applicationInfo.nativeLibraryDir)
     }
+
+    /** Real Node 18 (nodejs-mobile) when its native launcher is packaged. */
+    val nodeRuntime: NodeRuntime by lazy { NodeRuntime(nativeLibraryDir, workspace) }
+
+    /** BusyBox for the long tail of real shell utilities. */
+    val busybox: Busybox by lazy { Busybox(nativeLibraryDir, workspace) }
 
     /** Native Node if available, Rhino otherwise. */
     val activeNode: SyncScriptRuntime by lazy {
@@ -534,7 +541,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         agentExecutor.execute {
             try {
                 val projectDir = _selected.value?.dir
-                val tools = OpenCodeTools(workspace, activeNode, npxRuntime, projectDir, config.githubToken)
+                val tools = OpenCodeTools(workspace, activeNode, npxRuntime, projectDir, config.githubToken, busybox)
                 val agent = OpenCodeAgent(
                     workspace, tools, { LlmClient(config) }, projectDir,
                     maxSteps = config.safeMaxSteps,

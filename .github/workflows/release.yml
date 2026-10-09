@@ -60,6 +60,7 @@ jobs:
             ~/.chaquopy
             ~/.gradle/caches/modules-2
             android/.nodejs-mobile
+            android/.busybox
           key: chaquopy-${{ hashFiles('android/app/build.gradle.kts') }}
           restore-keys: chaquopy-
 

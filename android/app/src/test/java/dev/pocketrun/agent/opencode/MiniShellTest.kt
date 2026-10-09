@@ -76,6 +76,25 @@ class MiniShellTest {
     }
 
     @Test
+    fun unknownCommandFallsBackCleanlyWhenNoBusybox() {
+        val ws = Workspace.at(tmp.newFolder())
+        val sh = newShell(ws)
+        val r = sh.execute("definitely_not_a_command arg", ws.root)
+        assertEquals(127, r.exitCode)
+        assertTrue(r.output.contains("definitely_not_a_command"))
+    }
+
+    @Test
+    fun whichHandlesBuiltinsAndUnknown() {
+        val ws = Workspace.at(tmp.newFolder())
+        val sh = newShell(ws)
+        val known = sh.execute("which ls", ws.root)
+        assertEquals(0, known.exitCode)
+        val unknown = sh.execute("which definitely_not_a_command", ws.root)
+        assertEquals(1, unknown.exitCode)
+    }
+
+    @Test
     fun grepCaseInsensitive() {
         val ws = Workspace.at(tmp.newFolder())
         val sh = newShell(ws)

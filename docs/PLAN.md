@@ -243,7 +243,11 @@ Rhino-фолбэк (когда нативного лаунчера нет, на�
   `write`, `edit`, `list`, `glob`, `grep`, `apply_patch`, `todowrite`,
   `webfetch`, `skill`, `question` (без `lsp`/`websearch`);
 * `agent/opencode/MiniShell.kt` — мини-шелл для `bash`: ~26 встроенных команд,
-  кавычки, `&&`, `|`, `>` `>>`, плюс `python`/`node`/`npx` через рантаймы;
+  кавычки, `&&`, `|`, `>` `>>`, плюс `python`/`node`/`npx` через рантаймы и
+  настоящий BusyBox 1.34.1 (`runtime/shell/Busybox.kt`, собран для Android
+  из F-Droid meefik/busybox, кладётся в jniLibs как `libbusybox.so`):
+  любой applet работает как реальный бинарник — sed, awk, sort, uniq, cut,
+  tr, tar, gzip, xargs, diff, wget и т.д.; они не ограничены песочницей;
 * `agent/opencode/ApplyPatch.kt` — формат `*** Begin Patch` (Add/Update/Move
   to/Delete File), толерантный к отступам и diff-стилю контекста;
 * `agent/opencode/Skills.kt` — SKILL.md-навыки: проект `.opencode/.claude/.agents
@@ -296,6 +300,9 @@ tools/keygen/gradlew -p tools/keygen run --args="issue --name 'Jane Doe' --seat 
 * **Нет отмены запуска Python.** Chaquopy не прерывает вызов.
 * **npm-пакеты с нативными аддонами или postinstall-скриптами** через npx не
   заработают: на устройстве нет компилятора C/C++, чистый JS работает.
+* **applets BusyBox не ограничены песочницей** — это настоящие нативные
+  процессы с UID приложения: они могут читать/писать всё, что доступно
+  приложению, а не только workspace (встроенные команды остаются в jail).
 * **APK большой** — CPython 3.13 (~30–40 МБ на ABI) плюс `libnode.so`
   (~50 МБ на ABI в сжатом виде); сборка ограничена `arm64-v8a` и `x86_64`.
 * **Rhino-фолбэк ограничен** — если нативный лаунчер недоступен, `node`
