@@ -14,7 +14,7 @@ CI: `.github/workflows/android.yml` — сборка APK и тесты в GitHub
 | Слой | Реализация | Состояние |
 |---|---|---|
 | Python | настоящий CPython 3.13 через Chaquopy | бутстрап + Kotlin-мост `PythonRuntime` готовы |
-| Node.js | Rhino + собственный Node-совместимый слой | не начато |
+| Node.js | настоящий Node 18 (nodejs-mobile) + Rhino-фолбэк | готово |
 | npx | свой: реестр npm + распаковка tar + запуск `bin` | не начато |
 | opencode | инструменты, навыки, сессии и инструкции opencode-стиля (v1.3.0) | готово |
 | Релиз-ключ | Ed25519, офлайн-проверка, утилита keygen | **готово** |
@@ -27,21 +27,26 @@ CI: `.github/workflows/android.yml` — сборка APK и тесты в GitHub
 
 ## 2. Ключевые технические решения
 
-### 2.1 Почему не nodejs-mobile
+### 2.1 Node.js: настоящий Node 18, Rhino как фолбэк
 
-`nodejs-mobile` даёт настоящий Node 18 (`libnode.so`, 62 МБ на ABI), но:
+`nodejs-mobile` даёт настоящий Node 18 в виде `libnode.so` (~62 МБ на ABI), но
+без исполняемого файла. Android API 29+ запрещает запускать файлы из каталога
+данных приложения, поэтому:
 
-* требует JNI-слоя с встраиванием `node::` API и прокруткой uv-цикла событий —
-  непроверяемый нативный код без устройства;
-* `libnode.so` в комплекте не содержит npm, значит ещё ~12 МБ ассетов;
-* APK раздувается втрое.
+* берём `libnode.so` из релиза nodejs-mobile v18.20.4 (arm64-v8a, x86_64);
+* собираем лаунчер `cpp/noderunner.cpp` (`node::Start(argc, argv)`), линкуем
+  NDK clang'ом и упаковываем как `libnoderunner.so` прямо в `jniLibs` — Android
+  извлекает `lib*.so` в `nativeLibraryDir`, откуда их можно exec'нуть;
+* `packaging.jniLibs.useLegacyPackaging = true`, иначе библиотеки не
+  распакуются из APK и исполняемого файла на диске не будет;
+* `runtime/js/NodeRuntime.kt` запускает `libnoderunner.so` через
+  `ProcessBuilder` на каждый скрипт: настоящий изолированный и отменяемый
+  процесс; `LD_LIBRARY_PATH`, `NODE_PATH` и cwd пробрасываются.
 
-Поэтому JS-слой — это Rhino (чистая Java, работает везде) плюс написанный нами
-Node-совместимый слой: `require` с резолвом `node_modules`, `module`/`exports`,
-`__dirname`/`__filename`, `process`, `console`, `Buffer` (подмножество), `path`, `fs`,
-`os`, таймеры. Этого хватает для чистых JS-пакетов с npm.
-
-`docs/fetch-node.md` описывает, куда денется настоящий Node, если понадобится.
+Загрузка и сборка — Gradle-задачи `fetchNodeMobile` и `assembleNodeJniLibs`
+(кэш в `android/.nodejs-mobile`). Rhino + `assets/node/boot.js` остаются
+фолбэком, когда нативный лаунчер недоступен (например, JVM-тесты). APK растёт
+примерно вдвое.
 
 ### 2.2 Python
 
@@ -174,7 +179,21 @@ tools/keygen/                         отдельный JVM-проект: genke
   флаг, и по возвращению выдаётся код 130. Убийство процесса невозможно —
   это честно показано в UI.
 
-### 4.2 Node-совместимый слой ✅ готово (v1.2.0)
+### 4.2 Node ✅ готово: настоящий Node 18 + Rhino-фолбэк
+
+Нативный Node (основной путь на устройстве):
+
+* `cpp/noderunner.cpp` + Gradle-задачи `fetchNodeMobile` /
+  `assembleNodeJniLibs` в `android/app/build.gradle.kts` — скачивают
+  nodejs-mobile v18.20.4, собирают `libnoderunner.so` под arm64-v8a и x86_64 и
+  кладут рядом `libnode.so` и NDK-ный `libc++_shared.so`;
+* `runtime/js/NodeRuntime.kt` (`SyncScriptRuntime`) — `ProcessBuilder` на
+  каждый запуск, реальные stdout/stderr, отмена через `destroy()`, таймаут →
+  код 124; `AppViewModel.activeNode` выбирает его, когда лаунчер есть, иначе
+  падает на Rhino; `MiniShell`, `NpxRuntime` и `OpenCodeTools` работают через
+  интерфейс `SyncScriptRuntime`.
+
+Rhino-фолбэк (когда нативного лаунчера нет, например в JVM-тестах):
 
 * `runtime/js/JsRuntime.kt` — Rhino 1.8.1 `Context` (`VERSION_ES6`,
   `setOptimizationLevel(-1)`, `initSafeStandardObjects`), мост `__pr` на
@@ -275,10 +294,9 @@ tools/keygen/gradlew -p tools/keygen run --args="issue --name 'Jane Doe' --seat 
 
 * **Нет отзыва лицензий.** Только срок действия и смена публичного ключа в сборке.
 * **Нет отмены запуска Python.** Chaquopy не прерывает вызов.
-* **Нет нативных JS-модулей и worker_threads** в собственном Node-слое.
 * **npm-пакеты с нативными аддонами или postinstall-скриптами** через npx не
-  заработают.
-* **APK большой** — CPython 3.13 весит ~30–40 МБ на ABI; сборка ограничена
-  `arm64-v8a` и `x86_64`.
-* Локальная сборка Android в этом окружении прервана на середине; весь APK
-  собирается в GitHub Actions.
+  заработают: на устройстве нет компилятора C/C++, чистый JS работает.
+* **APK большой** — CPython 3.13 (~30–40 МБ на ABI) плюс `libnode.so`
+  (~50 МБ на ABI в сжатом виде); сборка ограничена `arm64-v8a` и `x86_64`.
+* **Rhino-фолбэк ограничен** — если нативный лаунчер недоступен, `node`
+  деградирует до ES6-слоя без class/async/import.

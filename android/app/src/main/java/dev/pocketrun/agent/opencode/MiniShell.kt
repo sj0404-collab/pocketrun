@@ -3,7 +3,7 @@ package dev.pocketrun.agent.opencode
 import dev.pocketrun.core.Workspace
 import dev.pocketrun.runtime.ExecRequest
 import dev.pocketrun.runtime.RuntimeKind
-import dev.pocketrun.runtime.js.JsRuntime
+import dev.pocketrun.runtime.SyncScriptRuntime
 import dev.pocketrun.runtime.npm.NpxRuntime
 import dev.pocketrun.runtime.python.PythonRuntime
 import java.io.File
@@ -22,7 +22,7 @@ import java.util.Locale
  */
 class MiniShell(
     private val workspace: Workspace,
-    private val jsRuntime: JsRuntime,
+    private val jsRuntime: SyncScriptRuntime,
     private val npxRuntime: NpxRuntime,
 ) {
 
@@ -40,7 +40,7 @@ class MiniShell(
         private val HELP = """
             Доступные команды: ${COMMANDS.joinToString(" ")}
             python <file.py> | python -c '<код>'   — CPython 3.13 (стандартная библиотека)
-            node <file.js>  | node -e '<код>'      — Node-совместимый слой (без class/async/import)
+            node <file.js>  | node -e '<код>'      — настоящий Node.js 18
             npx <пакет> [аргументы]               — чистые JS npm-пакеты
             npm init -y | npm install <пакет> | npm run <скрипт> | npm ls
                                                    — управление node-проектом (install качает

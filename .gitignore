@@ -12,6 +12,8 @@ license.key
 captures/
 .externalNativeBuild/
 .cxx/
+# nodejs-mobile download + staged native libs (fetched by the Gradle build).
+.nodejs-mobile/
 .DS_Store
 __pycache__/
 *.pyc

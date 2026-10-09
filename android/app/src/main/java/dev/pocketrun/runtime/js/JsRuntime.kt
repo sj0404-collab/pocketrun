@@ -9,6 +9,8 @@ import dev.pocketrun.runtime.ExecutionHandle
 import dev.pocketrun.runtime.OutputListener
 import dev.pocketrun.runtime.OutputTailer
 import dev.pocketrun.runtime.OutputStream
+import dev.pocketrun.runtime.RuntimeKind
+import dev.pocketrun.runtime.SyncScriptRuntime
 import org.mozilla.javascript.BaseFunction
 import org.mozilla.javascript.Context
 import org.mozilla.javascript.Function
@@ -49,7 +51,7 @@ class JsRuntime(
     private val bootSource: String,
     private val workspace: Workspace,
     private val maxRunMs: Long = 10 * 60_000L,
-) {
+) : SyncScriptRuntime {
 
     companion object {
         private const val TAG = "JsRuntime"
@@ -59,6 +61,10 @@ class JsRuntime(
         private const val MAX_HTTP_BODY = 4 * 1024 * 1024
         const val VERSION = "Rhino 1.8.1 (ES6,interpreted)"
     }
+
+    override val kind: RuntimeKind = RuntimeKind.NODE
+    override val version: String = VERSION
+    override fun isAvailable(): Boolean = true
 
     private val executor: ExecutorService = Executors.newSingleThreadExecutor { runnable ->
         Thread(runnable, "pocketrun-js-run").apply { isDaemon = true }
@@ -79,7 +85,7 @@ class JsRuntime(
         val errWriter by lazy { OutputStreamWriter(FileOutputStream(errFile, true), Charsets.UTF_8) }
     }
 
-    fun execute(request: ExecRequest, listener: OutputListener): ExecutionHandle {
+    override fun execute(request: ExecRequest, listener: OutputListener): ExecutionHandle {
         val cancelled = AtomicBoolean(false)
         val running = AtomicBoolean(true)
         val startedAt = System.currentTimeMillis()
@@ -129,7 +135,7 @@ class JsRuntime(
      * result. On timeout the run is flagged cancelled and a 124 result is
      * returned. Used by the agent's run_node tool.
      */
-    fun executeSync(request: ExecRequest, timeoutMs: Long): ExecResult {
+    override fun executeSync(request: ExecRequest, timeoutMs: Long): ExecResult {
         val done = java.util.concurrent.CompletableFuture<ExecResult>()
         val handle = execute(request, object : OutputListener {
             override fun onFinished(result: ExecResult) { done.complete(result) }

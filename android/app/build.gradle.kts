@@ -1,5 +1,7 @@
 import org.gradle.api.GradleException
+import java.net.URI
 import java.util.Properties
+import java.util.zip.ZipInputStream
 
 plugins {
     id("com.android.application")
@@ -57,9 +59,118 @@ gradle.taskGraph.whenReady {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Native Node.js (nodejs-mobile)
+//
+// nodejs-mobile ships real Node 18 as `libnode.so` but no executable. Android
+// only lets an app exec `lib*.so` files from its extracted native library dir,
+// so we build a tiny launcher on top of libnode and package it as
+// `libnoderunner.so`. The Kotlin NodeRuntime then execs it per script.
+//
+// Everything is cached under android/.nodejs-mobile so CI can cache the 57 MB
+// download and repeated builds are offline.
+// ---------------------------------------------------------------------------
+
+val nodeMobileVersion = "18.20.4"
+val nodeMobileAbis = listOf("arm64-v8a", "x86_64")
+val nodeMobileDir: File = rootProject.file(".nodejs-mobile")
+val nodeMobileZip = File(nodeMobileDir, "nodejs-mobile-$nodeMobileVersion-android.zip")
+val nodeMobileJniLibs = File(nodeMobileDir, "jniLibs")
+val nodeMobileMarker = File(nodeMobileDir, ".unpacked-$nodeMobileVersion")
+
+val fetchNodeMobile by tasks.registering {
+    description = "Downloads and unpacks nodejs-mobile (real Node $nodeMobileVersion)."
+    inputs.property("version", nodeMobileVersion)
+    outputs.file(nodeMobileMarker)
+    doLast {
+        nodeMobileDir.mkdirs()
+        if (!nodeMobileZip.isFile) {
+            val url = "https://github.com/nodejs-mobile/nodejs-mobile/releases/download/" +
+                "v$nodeMobileVersion/nodejs-mobile-v$nodeMobileVersion-android.zip"
+            logger.lifecycle("PocketRun: downloading real Node.js from $url")
+            val tmp = File(nodeMobileDir, "download.part")
+            URI(url).toURL().openStream().use { input ->
+                tmp.outputStream().use { out -> input.copyTo(out) }
+            }
+            tmp.renameTo(nodeMobileZip)
+        }
+        if (!nodeMobileMarker.isFile) {
+            File(nodeMobileDir, "include").deleteRecursively()
+            File(nodeMobileDir, "bin").deleteRecursively()
+            ZipInputStream(nodeMobileZip.inputStream().buffered()).use { zin ->
+                var entry = zin.nextEntry
+                while (entry != null) {
+                    val name = entry.name
+                    val wanted = name.startsWith("include/node/") ||
+                        nodeMobileAbis.any { name == "bin/$it/libnode.so" }
+                    if (wanted && !entry.isDirectory) {
+                        val target = File(nodeMobileDir, name)
+                        target.parentFile?.mkdirs()
+                        target.outputStream().use { out -> zin.copyTo(out) }
+                    }
+                    zin.closeEntry()
+                    entry = zin.nextEntry
+                }
+            }
+            nodeMobileMarker.writeText(nodeMobileVersion)
+        }
+    }
+}
+
+val assembleNodeJniLibs by tasks.registering {
+    description = "Builds libnoderunner.so per ABI and stages libnode.so/libc++_shared.so."
+    dependsOn(fetchNodeMobile)
+    inputs.property("version", nodeMobileVersion)
+    inputs.file(layout.projectDirectory.file("src/main/cpp/noderunner.cpp"))
+    outputs.dir(nodeMobileJniLibs)
+    doLast {
+        val ndk = android.ndkDirectory
+        val toolchain = File(ndk, "toolchains/llvm/prebuilt/linux-x86_64")
+        val sysroot = File(toolchain, "sysroot")
+        val abiClang = mapOf(
+            "arm64-v8a" to ("aarch64-linux-android26-clang++" to "aarch64-linux-android"),
+            "x86_64" to ("x86_64-linux-android26-clang++" to "x86_64-linux-android"),
+        )
+        nodeMobileJniLibs.deleteRecursively()
+        for (abi in nodeMobileAbis) {
+            val (clangName, stlDir) = abiClang.getValue(abi)
+            val dest = File(nodeMobileJniLibs, abi).apply { mkdirs() }
+
+            val libnode = File(nodeMobileDir, "bin/$abi/libnode.so")
+            require(libnode.isFile) { "nodejs-mobile: missing $libnode (run fetchNodeMobile)" }
+            libnode.copyTo(File(dest, "libnode.so"), overwrite = true)
+
+            val stl = File(sysroot, "usr/lib/$stlDir/libc++_shared.so")
+            require(stl.isFile) { "NDK: missing $stl" }
+            stl.copyTo(File(dest, "libc++_shared.so"), overwrite = true)
+
+            val clang = File(toolchain, "bin/$clangName")
+            val args = listOf(
+                clang.absolutePath,
+                "-std=c++17", "-fPIC", "-shared",
+                "-I", File(nodeMobileDir, "include/node").absolutePath,
+                layout.projectDirectory.file("src/main/cpp/noderunner.cpp").asFile.absolutePath,
+                "-L", File(nodeMobileDir, "bin/$abi").absolutePath,
+                "-lnode", "-llog",
+                "-Wl,-rpath,\$ORIGIN",
+                "-o", File(dest, "libnoderunner.so").absolutePath,
+            )
+            val proc = ProcessBuilder(args).redirectErrorStream(true).start()
+            val output = proc.inputStream.bufferedReader().use { it.readText() }
+            val code = proc.waitFor()
+            if (code != 0) throw GradleException("noderunner ($abi) failed ($code):\n$output")
+        }
+    }
+}
+
+tasks.matching { it.name == "preBuild" }.configureEach { dependsOn(assembleNodeJniLibs) }
+
 android {
     namespace = "dev.pocketrun"
     compileSdk = 35
+    ndkVersion = "27.3.13750724"
+
+    sourceSets["main"].jniLibs.srcDir(nodeMobileJniLibs)
 
     defaultConfig {
         applicationId = "dev.pocketrun"
@@ -131,6 +242,11 @@ android {
                 "META-INF/DEPENDENCIES",
                 "META-INF/INDEX.LIST",
             )
+        }
+        jniLibs {
+            // libnoderunner.so is executed, so it must be extracted to
+            // nativeLibraryDir rather than loaded straight out of the APK.
+            useLegacyPackaging = true
         }
     }
 

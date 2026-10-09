@@ -7,7 +7,7 @@ import dev.pocketrun.runtime.ExecutionHandle
 import dev.pocketrun.runtime.OutputListener
 import dev.pocketrun.runtime.OutputStream
 import dev.pocketrun.runtime.RuntimeKind
-import dev.pocketrun.runtime.js.JsRuntime
+import dev.pocketrun.runtime.SyncScriptRuntime
 import org.json.JSONObject
 import java.io.File
 import java.util.UUID
@@ -29,7 +29,7 @@ import java.util.concurrent.atomic.AtomicReference
  * those cannot work inside the sandbox and are skipped.
  */
 class NpxRuntime(
-    private val js: JsRuntime,
+    private val js: SyncScriptRuntime,
     private val workspace: Workspace,
     private val registry: NpmRegistry = NpmRegistry(),
 ) {

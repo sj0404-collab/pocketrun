@@ -40,12 +40,13 @@ jobs:
 
       - uses: gradle/actions/setup-gradle@v4
 
-      - name: Cache Chaquopy downloads
+      - name: Cache Chaquopy + nodejs-mobile downloads
         uses: actions/cache@v4
         with:
           path: |
             ~/.chaquopy
             ~/.gradle/caches/modules-2
+            android/.nodejs-mobile
           key: chaquopy-${{ hashFiles('android/app/build.gradle.kts') }}
           restore-keys: chaquopy-
 

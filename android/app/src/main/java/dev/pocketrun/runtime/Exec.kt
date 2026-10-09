@@ -56,3 +56,12 @@ interface ScriptRuntime {
     fun isAvailable(): Boolean
     fun execute(request: ExecRequest, listener: OutputListener): ExecutionHandle
 }
+
+/**
+ * A [ScriptRuntime] that can also run to completion synchronously. Used by the
+ * agent shell and by npx, which have no coroutines/callbacks. Both the Rhino
+ * fallback ([dev.pocketrun.runtime.js.JsRuntime]) and native Node implement it.
+ */
+interface SyncScriptRuntime : ScriptRuntime {
+    fun executeSync(request: ExecRequest, timeoutMs: Long): ExecResult
+}

@@ -33,7 +33,9 @@ import dev.pocketrun.runtime.ExecutionHandle
 import dev.pocketrun.runtime.OutputListener
 import dev.pocketrun.runtime.OutputStream
 import dev.pocketrun.runtime.RuntimeKind
+import dev.pocketrun.runtime.SyncScriptRuntime
 import dev.pocketrun.runtime.js.JsRuntime
+import dev.pocketrun.runtime.js.NodeRuntime
 import dev.pocketrun.runtime.npm.NpxRuntime
 import dev.pocketrun.runtime.python.PythonRuntime
 import dev.pocketrun.update.AppUpdate
@@ -191,7 +193,17 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         JsRuntime(boot, workspace)
     }
 
-    val npxRuntime: NpxRuntime by lazy { NpxRuntime(jsRuntime, workspace) }
+    /** Real Node 18 (nodejs-mobile) when its native launcher is packaged. */
+    val nodeRuntime: NodeRuntime by lazy {
+        NodeRuntime(File(getApplication<Application>().applicationInfo.nativeLibraryDir), workspace)
+    }
+
+    /** Native Node if available, Rhino otherwise. */
+    val activeNode: SyncScriptRuntime by lazy {
+        if (nodeRuntime.isAvailable()) nodeRuntime else jsRuntime
+    }
+
+    val npxRuntime: NpxRuntime by lazy { NpxRuntime(activeNode, workspace) }
 
     // ---------------------------------------------------------------- agent
 
@@ -522,7 +534,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         agentExecutor.execute {
             try {
                 val projectDir = _selected.value?.dir
-                val tools = OpenCodeTools(workspace, jsRuntime, npxRuntime, projectDir, config.githubToken)
+                val tools = OpenCodeTools(workspace, activeNode, npxRuntime, projectDir, config.githubToken)
                 val agent = OpenCodeAgent(
                     workspace, tools, { LlmClient(config) }, projectDir,
                     maxSteps = config.safeMaxSteps,
@@ -1338,12 +1350,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun runtimeAvailable(): Boolean = when (editorMode.value) {
-        RuntimeKind.NODE, RuntimeKind.NPX -> true
+        RuntimeKind.NODE, RuntimeKind.NPX -> activeNode.isAvailable()
         else -> PythonRuntime.isAvailable()
     }
 
     fun runtimeVersion(): String? = when (editorMode.value) {
-        RuntimeKind.NODE, RuntimeKind.NPX -> JsRuntime.VERSION
+        RuntimeKind.NODE, RuntimeKind.NPX -> activeNode.version
         else -> PythonRuntime.version()
     }
 
@@ -1355,7 +1367,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 saveScript(text)
                 _output.value = emptyList()
                 _runState.value = RunState.Running
-                handle = jsRuntime.execute(
+                handle = activeNode.execute(
                     ExecRequest(
                         kind = RuntimeKind.NODE,
                         target = File(project.dir, "main.js").absolutePath,

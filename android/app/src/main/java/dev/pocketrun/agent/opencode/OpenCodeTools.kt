@@ -1,7 +1,7 @@
 package dev.pocketrun.agent.opencode
 
 import dev.pocketrun.core.Workspace
-import dev.pocketrun.runtime.js.JsRuntime
+import dev.pocketrun.runtime.SyncScriptRuntime
 import dev.pocketrun.runtime.npm.NpxRuntime
 import org.json.JSONArray
 import org.json.JSONObject
@@ -17,7 +17,7 @@ import java.net.URL
  */
 class OpenCodeTools(
     private val workspace: Workspace,
-    jsRuntime: JsRuntime,
+    jsRuntime: SyncScriptRuntime,
     npxRuntime: NpxRuntime,
     private val projectDir: File?,
     private val githubToken: String = "",
