@@ -146,9 +146,12 @@ val assembleNodeJniLibs by tasks.registering {
             stl.copyTo(File(dest, "libc++_shared.so"), overwrite = true)
 
             val clang = File(toolchain, "bin/$clangName")
+            // PIE executable (not -shared): Android refuses to run a DYN with a
+            // null entry point, so a -shared launcher dies with SIGSEGV=139 the
+            // moment it is exec'd.
             val args = listOf(
                 clang.absolutePath,
-                "-std=c++17", "-fPIC", "-shared",
+                "-std=c++17", "-fPIC", "-pie",
                 "-I", File(nodeMobileDir, "include/node").absolutePath,
                 layout.projectDirectory.file("src/main/cpp/noderunner.cpp").asFile.absolutePath,
                 "-L", File(nodeMobileDir, "bin/$abi").absolutePath,
