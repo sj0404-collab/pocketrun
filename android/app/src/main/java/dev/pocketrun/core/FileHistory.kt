@@ -2,6 +2,7 @@ package dev.pocketrun.core
 
 import java.io.File
 import java.io.IOException
+import java.util.concurrent.atomic.AtomicLong
 
 /** One saved copy of a file, newest first when listed. */
 data class Version(
@@ -94,7 +95,14 @@ class FileHistory(private val root: File) {
         project = project,
     )
 
-    private fun stamp(): String = String.format("%013d", System.currentTimeMillis())
+    private fun stamp(): String = String.format(
+        // millisecond << counter: two snapshots in the same millisecond (e.g. a
+        // restore() snapshoting the pre-restore content) must not collide, or
+        // the copy is silently dropped and "restore is undoable" breaks.
+        "%017d", System.currentTimeMillis() * 10_000 + counter.incrementAndGet() % 10_000,
+    )
+
+    private val counter = AtomicLong()
 
     companion object {
         fun under(workspace: Workspace): FileHistory =
