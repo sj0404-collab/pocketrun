@@ -27,6 +27,14 @@ class FileOpsTest {
     }
 
     @Test
+    fun controlCharactersInANameAreRejected() {
+        assertNull(FileOps.safeName("a\u0000b"))
+        assertNull(FileOps.safeName("line\nbreak"))
+        assertNull(FileOps.safeName("tab\there"))
+        assertEquals("a b", FileOps.safeName("a b"))
+    }
+
+    @Test
     fun aTakenNameGetsACounter() {
         val root = dir()
         File(root, "main.py").writeText("a")
@@ -200,5 +208,50 @@ class FileHistoryTest {
         assertEquals(1, history.versionsOf(a, project).size)
         assertEquals(1, history.versionsOf(b, project).size)
         assertEquals("1", FileText.read(history.versionsOf(a, project).first().file))
+    }
+
+    private fun project(): File = File.createTempFile("pocketrun-hist", "").let {
+        it.delete()
+        it.mkdirs()
+        it
+    }
+
+    @Test
+    fun versionsAreNewestFirstAndCarryARealTimestamp() {
+        val project = project()
+        val history = FileHistory(File(project, ".history"))
+        val file = File(project, "notes.txt")
+        file.writeText("one")
+        val first = history.snapshot(file, project)!!
+        Thread.sleep(5)
+        file.writeText("two")
+        val second = history.snapshot(file, project)!!
+
+        val versions = history.versionsOf(file, project)
+        assertEquals(2, versions.size)
+        assertEquals(second.file.name, versions.first().file.name)
+        assertTrue("newer snapshot sorts first", versions[0].stamp >= versions[1].stamp)
+        // The stamp is the snapshot wall clock, not the composite sort key:
+        // dividing the key back out was what the parse used to forget.
+        assertTrue(
+            "stamp is near now: ${versions[0].stamp}",
+            kotlin.math.abs(versions[0].stamp - System.currentTimeMillis()) < 60_000,
+        )
+        assertEquals("notes.txt", versions[0].label)
+        assertEquals("two", FileText.read(versions[0].file))
+        assertEquals("one", FileText.read(versions[1].file))
+        assertTrue(first.file.name != second.file.name)
+    }
+
+    @Test
+    fun twoSnapshotsInTheSameMillisecondDoNotCollide() {
+        val project = project()
+        val history = FileHistory(File(project, ".history"))
+        val file = File(project, "main.py")
+        file.writeText("v1")
+        assertNotNull(history.snapshot(file, project))
+        assertNotNull(history.snapshot(file, project))
+        // Collision-free names are what makes "restore is undoable" hold.
+        assertEquals(2, history.versionsOf(file, project).size)
     }
 }

@@ -32,7 +32,7 @@ class FileHistory(private val root: File) {
     fun snapshot(file: File, projectDir: File): Version? {
         if (!file.isFile) return null
         val dir = dirFor(file, projectDir)
-        val target = File(dir, "${stamp()}_${file.name.take(80)}")
+        val target = File(dir, "${stamp()}__${file.name.take(80)}")
         return try {
             file.copyTo(target, overwrite = false)
             version(target, projectDir.name)
@@ -90,7 +90,12 @@ class FileHistory(private val root: File) {
 
     private fun version(file: File, project: String): Version = Version(
         file = file,
-        stamp = file.name.substringBefore("__").toLongOrNull() ?: 0L,
+        // The name carries the composite sort key (millisecond * TICKS + a
+        // per-process counter); dividing it back out gives the snapshot time
+        // that the history dialog shows. Fall back to the file's own mtime when
+        // the name is unrecognisable, so a stray file still has a sane label.
+        stamp = file.name.substringBefore("__").toLongOrNull()?.div(STAMP_TICKS)
+            ?: file.lastModified(),
         size = file.length(),
         project = project,
     )
@@ -99,12 +104,15 @@ class FileHistory(private val root: File) {
         // millisecond << counter: two snapshots in the same millisecond (e.g. a
         // restore() snapshoting the pre-restore content) must not collide, or
         // the copy is silently dropped and "restore is undoable" breaks.
-        "%017d", System.currentTimeMillis() * 10_000 + counter.incrementAndGet() % 10_000,
+        "%017d", System.currentTimeMillis() * STAMP_TICKS + counter.incrementAndGet() % STAMP_TICKS,
     )
 
     private val counter = AtomicLong()
 
     companion object {
+        /** Room for the per-millisecond counter inside the composite sort key. */
+        private const val STAMP_TICKS = 10_000L
+
         fun under(workspace: Workspace): FileHistory =
             FileHistory(File(workspace.root, ".history"))
     }

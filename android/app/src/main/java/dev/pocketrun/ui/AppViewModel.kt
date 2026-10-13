@@ -1448,6 +1448,11 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     override fun onCleared() {
         stopWatching()
+        // The executors are single-threaded and daemon, but they own the app's
+        // background work; leaving them running past the ViewModel keeps a
+        // cancelled agent turn or a half-written file alive for no reason.
+        agentExecutor.shutdownNow()
+        ioExecutor.shutdownNow()
         super.onCleared()
     }
 
