@@ -148,4 +148,118 @@ class OpenCodeToolsGateTest {
         h.tools.execute("bash", """{"command":"echo hi"}""")
         assertEquals(listOf("bash"), seen)
     }
+
+    @Test
+    fun taskToolIsOfferedOnlyWhenARunnerIsSet() {
+        val h = newTools()
+        assertFalse(h.tools.definitions().toString().contains("\"name\":\"task\""))
+
+        h.tools.subagentRunner = { "done" }
+        assertTrue(h.tools.definitions().toString().contains("\"name\":\"task\""))
+    }
+
+    @Test
+    fun taskToolHandsThePromptToTheRunner() {
+        val h = newTools()
+        var got: OpenCodeTools.TaskRequest? = null
+        h.tools.subagentRunner = { req ->
+            got = req
+            "result: ${req.subagentType}"
+        }
+        val r = h.tools.execute("task", """{"description":"look","prompt":"find X","subagent_type":"explore"}""")
+        assertEquals("result: explore", r)
+        assertEquals("find X", got?.prompt)
+        assertEquals("explore", got?.subagentType)
+    }
+
+    @Test
+    fun taskToolWithoutPromptIsAnError() {
+        val h = newTools()
+        h.tools.subagentRunner = { "unused" }
+        assertTrue(h.tools.execute("task", """{"description":"x","subagent_type":"general"}""").contains("нужен непустой prompt"))
+    }
+
+    @Test
+    fun allowedToolsRestrictBothDefinitionsAndCalls() {
+        val h = newTools()
+        File(h.projectDir, "a.txt").writeText("hi")
+        h.tools.allowedTools = OpenCodeTools.subagentTools("explore")
+
+        val defs = h.tools.definitions().toString()
+        assertTrue(defs.contains("\"name\":\"read\""))
+        assertFalse(defs.contains("\"name\":\"write\""))
+        assertFalse(defs.contains("\"name\":\"bash\""))
+
+        assertTrue(h.tools.execute("read", """{"filePath":"a.txt"}""").contains("hi"))
+        assertTrue(h.tools.execute("write", """{"filePath":"b.txt","content":"x"}""").contains("недоступен"))
+    }
+
+    @Test
+    fun exploreSubagentCannotMutateGeneralCan() {
+        val explore = OpenCodeTools.subagentTools("explore")
+        assertTrue("read" in explore)
+        assertFalse("write" in explore)
+        assertFalse("bash" in explore)
+        assertFalse("task" in explore)
+
+        val general = OpenCodeTools.subagentTools("general")
+        assertTrue("write" in general)
+        assertTrue("bash" in general)
+        assertFalse("task" in general)
+        assertFalse("question" in general)
+    }
+
+    @Test
+    fun configDenyBlocksAWrite() {
+        val h = newTools()
+        h.tools.permissionResolver = { _, _ -> OpenCodeConfig.Permission.DENY }
+        val r = h.tools.execute("write", """{"filePath":"x.txt","content":"no"}""")
+        assertTrue(r.startsWith("(запрещено"))
+        assertFalse(File(h.projectDir, "x.txt").exists())
+    }
+
+    @Test
+    fun configAskUsesTheApprover() {
+        val h = newTools()
+        h.tools.permissionResolver = { _, _ -> OpenCodeConfig.Permission.ASK }
+        var asked = false
+        h.tools.toolApprover = { _, _ ->
+            asked = true
+            true
+        }
+        h.tools.execute("write", """{"filePath":"x.txt","content":"yes"}""")
+        assertTrue(asked)
+        assertEquals("yes", File(h.projectDir, "x.txt").readText())
+    }
+
+    @Test
+    fun askWithoutAnApproverIsRefused() {
+        val h = newTools()
+        h.tools.permissionResolver = { _, _ -> OpenCodeConfig.Permission.ASK }
+        val r = h.tools.execute("write", """{"filePath":"x.txt","content":"no"}""")
+        assertTrue(r.contains("нужно подтверждение"))
+        assertFalse(File(h.projectDir, "x.txt").exists())
+    }
+
+    @Test
+    fun resolverOverridesDefaultForARead() {
+        val h = newTools()
+        File(h.projectDir, "a.txt").writeText("hi")
+        h.tools.permissionResolver = { _, _ -> OpenCodeConfig.Permission.ASK }
+        h.tools.toolApprover = { _, _ -> false }
+        assertEquals("(отклонено пользователем)", h.tools.execute("read", """{"filePath":"a.txt"}"""))
+    }
+
+    @Test
+    fun onBeforeWriteFiresForEachChangedFile() {
+        val h = newTools()
+        val seen = mutableListOf<String>()
+        h.tools.onBeforeWrite = { f -> seen += f.name }
+        File(h.projectDir, "a.txt").writeText("one")
+        h.tools.execute("write", """{"filePath":"a.txt","content":"two"}""")
+        h.tools.execute("edit", """{"filePath":"a.txt","oldString":"two","newString":"three"}""")
+        h.tools.execute("apply_patch", """{"patchText":"*** Begin Patch\n*** Add File: b.txt\n+hi\n*** End Patch"}""")
+        assertTrue(seen.contains("a.txt"))
+        assertTrue(seen.contains("b.txt"))
+    }
 }

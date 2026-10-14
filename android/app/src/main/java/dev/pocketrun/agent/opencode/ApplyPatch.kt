@@ -28,7 +28,7 @@ object ApplyPatch {
 
     data class PatchResult(val applied: List<String>, val skipped: List<String>)
 
-    fun apply(patchText: String, resolve: (String) -> File?): PatchResult {
+    fun apply(patchText: String, resolve: (String) -> File?, onBeforeWrite: ((File) -> Unit)? = null): PatchResult {
         val rawLines = patchText.lines()
         if (rawLines.firstOrNull()?.trim() != "*** Begin Patch") {
             throw PatchException("патч должен начинаться с '*** Begin Patch'")
@@ -65,6 +65,7 @@ object ApplyPatch {
                     }
                     val f = resolve(path) ?: throw PatchException("путь вне песочницы: $path")
                     f.parentFile?.mkdirs()
+                    onBeforeWrite?.invoke(f)
                     f.writeText(content.toString(), Charsets.UTF_8)
                     applied += "add $path"
                 }
@@ -108,6 +109,7 @@ object ApplyPatch {
                     val old = f.readText(Charsets.UTF_8)
                     val updated = applyHunks(old, hunks, path)
                     val target = moveTo?.let { resolve(it) ?: throw PatchException("путь вне песочницы: $it") } ?: f
+                    onBeforeWrite?.invoke(f)
                     if (target != f) {
                         f.delete()
                         target.parentFile?.mkdirs()
@@ -118,7 +120,10 @@ object ApplyPatch {
                 line.trimStart().startsWith("*** Delete File:") -> {
                     val path = line.trimStart().removePrefix("*** Delete File:").trim()
                     val f = resolve(path)
-                    if (f != null && f.isFile && f.delete()) applied += "delete $path" else skipped += "delete $path (не найден)"
+                    if (f != null && f.isFile) {
+                        onBeforeWrite?.invoke(f)
+                        if (f.delete()) applied += "delete $path" else skipped += "delete $path (не найден)"
+                    } else skipped += "delete $path (не найден)"
                     i++
                 }
                 line.isBlank() -> i++

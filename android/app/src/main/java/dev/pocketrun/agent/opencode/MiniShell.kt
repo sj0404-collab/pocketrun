@@ -575,15 +575,20 @@ class MiniShell(
 
     private fun runCodeFile(ext: String, code: String, dir: File, timeoutMs: Long, python: Boolean): Result {
         val scratch = File(workspace.cache, "opencode-shell").apply { mkdirs() }
-        val f = File(scratch, "cmd.${if (python) "py" else "js"}")
+        // Unique per call: parallel sessions run bash on the same file name.
+        val f = File(scratch, "cmd-${java.util.UUID.randomUUID().toString().take(8)}.${if (python) "py" else "js"}")
         f.writeText(code, Charsets.UTF_8)
-        val r = if (python) {
-            if (!PythonRuntime.isAvailable()) return Result(1, "python: рантайм ещё запускается\n")
-            PythonRuntime.executeSync(ExecRequest(RuntimeKind.PYTHON, f.absolutePath, emptyList(), dir), timeoutMs)
-        } else {
-            jsRuntime.executeSync(ExecRequest(RuntimeKind.NODE, f.absolutePath, emptyList(), dir), timeoutMs)
+        try {
+            val r = if (python) {
+                if (!PythonRuntime.isAvailable()) return Result(1, "python: рантайм ещё запускается\n")
+                PythonRuntime.executeSync(ExecRequest(RuntimeKind.PYTHON, f.absolutePath, emptyList(), dir), timeoutMs)
+            } else {
+                jsRuntime.executeSync(ExecRequest(RuntimeKind.NODE, f.absolutePath, emptyList(), dir), timeoutMs)
+            }
+            return Result(r.exitCode, r.stdout + (if (r.stderr.isNotBlank()) r.stderr else ""))
+        } finally {
+            f.delete()
         }
-        return Result(r.exitCode, r.stdout + (if (r.stderr.isNotBlank()) r.stderr else ""))
     }
 
     // ---------------------------------------------------------------- helpers

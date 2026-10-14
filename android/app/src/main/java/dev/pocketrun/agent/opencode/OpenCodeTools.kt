@@ -32,6 +32,15 @@ class OpenCodeTools(
 
         /** A single bash command may run this long — npm installs and builds need it. */
         const val BASH_TIMEOUT_MS = 300_000L
+
+        /** Tools a subagent of [type] may use (subagents cannot ask or nest). */
+        fun subagentTools(type: String): Set<String> = when (type) {
+            "explore" -> setOf("read", "list", "glob", "grep", "webfetch")
+            else -> setOf(
+                "bash", "read", "write", "edit", "list", "glob", "grep",
+                "apply_patch", "todowrite", "webfetch", "skill", "github",
+            )
+        }
     }
 
     private val shell = MiniShell(workspace, jsRuntime, npxRuntime, busybox)
@@ -50,6 +59,14 @@ class OpenCodeTools(
     var toolApprover: ((name: String, argsJson: String) -> Boolean)? = null
 
     /**
+     * Permission gate: opencode.json rules + the current mode. Returns the
+     * decision for a call; null means "no opinion" (the tool set decides).
+     * Replaces the old approver-only check when set by the runner.
+     */
+    @Volatile
+    var permissionResolver: ((name: String, argsJson: String) -> OpenCodeConfig.Permission)? = null
+
+    /**
      * Polled by long-waiting tools (github run_wait) so that ⏹ actually stops
      * a turn that is only waiting for a CI run.
      */
@@ -60,13 +77,39 @@ class OpenCodeTools(
     @Volatile
     var onTodos: ((List<Sessions.Todo>) -> Unit)? = null
 
+    /**
+     * Called right before this tool changes a file, so the runner can snapshot
+     * its current contents for `/undo`. Covers write/edit/apply_patch.
+     */
+    @Volatile
+    var onBeforeWrite: ((File) -> Unit)? = null
+
     /** The current todo list; seeded from the session before each turn. */
     var todos: List<Sessions.Todo> = emptyList()
 
+    /**
+     * Restricts the tools offered to the model (and callable). `null` means
+     * everything; a subagent gets only the tools its type allows.
+     */
+    var allowedTools: Set<String>? = null
+
+    /**
+     * Runs a subagent for the `task` tool. Set on the parent tools instance
+     * (subagents themselves do not get a task tool, so nesting is impossible).
+     */
+    @Volatile
+    var subagentRunner: ((TaskRequest) -> String)? = null
+
     data class Question(val header: String?, val question: String, val options: List<String>)
+
+    data class TaskRequest(val description: String, val prompt: String, val subagentType: String)
+
+    /** True when the model may call this tool (respecting [allowedTools]). */
+    private fun permitted(name: String): Boolean = allowedTools?.contains(name) ?: true
 
     fun definitions(): JSONArray = JSONArray().apply {
         fun tool(name: String, description: String, properties: JSONObject, required: List<String>) {
+            if (!permitted(name)) return
             put(
                 JSONObject().apply {
                     put("type", "function")
@@ -254,16 +297,42 @@ class OpenCodeTools(
                 .put("body", str("body", "JSON body (api)")),
             listOf("op"),
         )
+        if (subagentRunner != null) {
+            tool(
+                "task",
+                "Launch a subagent to handle a self-contained task in its own child session. " +
+                    "Two kinds: `explore` (read-only search: read/list/glob/grep/webfetch — use it to find code fast) and " +
+                    "`general` (full toolset except task, can edit and run commands). The subagent works autonomously " +
+                    "with the prompt you give it and returns its final text. Give it all the context it needs — it cannot ask you.",
+                JSONObject()
+                    .put("description", str("description", "short (3-5 word) description of the task"))
+                    .put("prompt", str("prompt", "the full, self-contained instructions for the subagent"))
+                    .put("subagent_type", str("subagent_type", "explore, general, or a custom agent name")),
+                listOf("description", "prompt", "subagent_type"),
+            )
+        }
     }
 
     /** Executes one tool call; never throws — errors come back as text. */
     fun execute(name: String, argsJson: String): String {
         return try {
+            if (!permitted(name)) return "error: инструмент '$name' недоступен этому агенту"
             val args = JSONObject(argsJson.ifBlank { "{}" })
-            // Manual confirmation gate: mutating tools ask the user first.
-            val approver = toolApprover
-            if (approver != null && !isReadOnly(name, args)) {
-                if (!approver(name, argsJson)) return "(отклонено пользователем)"
+            // Permission gate: opencode.json / agent rules decide allow/ask/deny.
+            // Without a resolver, the old rule stands — mutating tools ask the UI
+            // approver (set in manual mode), reads run freely.
+            val decision = permissionResolver?.invoke(name, argsJson)
+                ?: if (isReadOnly(name, args)) OpenCodeConfig.Permission.ALLOW
+                else if (toolApprover != null) OpenCodeConfig.Permission.ASK
+                else OpenCodeConfig.Permission.ALLOW
+            when (decision) {
+                OpenCodeConfig.Permission.DENY -> return "(запрещено настройками: $name)"
+                OpenCodeConfig.Permission.ASK -> {
+                    val approver = toolApprover
+                        ?: return "(нужно подтверждение для $name — включите режим «Вручную» или разрешите инструмент в opencode.json)"
+                    if (!approver(name, argsJson)) return "(отклонено пользователем)"
+                }
+                OpenCodeConfig.Permission.ALLOW -> Unit
             }
             when (name) {
                 "bash" -> doBash(args)
@@ -279,6 +348,7 @@ class OpenCodeTools(
                 "skill" -> doSkill(args)
                 "question" -> doQuestion(args)
                 "github" -> doGitHub(args)
+                "task" -> doTask(args)
                 else -> "unknown tool: $name"
             }
         } catch (t: Throwable) {
@@ -329,6 +399,7 @@ class OpenCodeTools(
         if (path.isBlank()) return "error: пустой путь"
         val f = resolve(path) ?: return "error: путь вне песочницы"
         f.parentFile?.mkdirs()
+        onBeforeWrite?.invoke(f)
         f.writeText(args.optString("content", ""), Charsets.UTF_8)
         return "wrote ${args.optString("content", "").length} chars to ${workspace.relativeTo(f)}"
     }
@@ -346,6 +417,7 @@ class OpenCodeTools(
             return "error: oldString встречается $count раз — уточните текст или передайте replaceAll: true"
         }
         val updated = if (args.optBoolean("replaceAll", false)) text.replace(old, new) else text.replaceFirst(old, new)
+        onBeforeWrite?.invoke(f)
         f.writeText(updated, Charsets.UTF_8)
         return "ok: заменено вхождений: ${if (args.optBoolean("replaceAll", false)) count else 1}"
     }
@@ -398,7 +470,7 @@ class OpenCodeTools(
 
     private fun doApplyPatch(args: JSONObject): String {
         return try {
-            val result = ApplyPatch.apply(args.getString("patchText")) { path -> resolve(path) }
+            val result = ApplyPatch.apply(args.getString("patchText"), { path -> resolve(path) }, onBeforeWrite)
             buildString {
                 if (result.applied.isNotEmpty()) appendLine(result.applied.joinToString("\n"))
                 if (result.skipped.isNotEmpty()) appendLine("skipped: " + result.skipped.joinToString("; "))
@@ -469,6 +541,20 @@ class OpenCodeTools(
         if (questions.isEmpty()) return "error: нет вопросов"
         val asker = questionAsker ?: return "(вопросы недоступны в этом режиме)"
         return asker(questions)
+    }
+
+    private fun doTask(args: JSONObject): String {
+        val runner = subagentRunner ?: return "error: субагенты недоступны в этом режиме"
+        if (!permitted("task")) return "error: субагенты недоступны этому агенту"
+        val prompt = args.optString("prompt").trim()
+        if (prompt.isEmpty()) return "error: нужен непустой prompt для субагента"
+        val type = args.optString("subagent_type", "general").trim().lowercase().ifEmpty { "general" }
+        val description = args.optString("description").takeIf { it.isNotBlank() } ?: "subtask"
+        return try {
+            runner(TaskRequest(description, prompt, type))
+        } catch (t: Throwable) {
+            "error субагента: ${t.message ?: t.javaClass.simpleName}"
+        }
     }
 
     private fun doGitHub(args: JSONObject): String {

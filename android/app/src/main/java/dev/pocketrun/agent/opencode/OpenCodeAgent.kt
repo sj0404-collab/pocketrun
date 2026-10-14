@@ -28,6 +28,11 @@ class OpenCodeAgent(
     private val hasGitHub: Boolean = false,
     /** Polled before every request and between tool calls: this is what ⏹ does. */
     private val isCancelled: () -> Boolean = { false },
+    /** When set, this run is a `task` subagent of the given type (explore/general). */
+    private val subagentType: String? = null,
+    /** A custom agent selected with `/agent`; its prompt is injected below. */
+    private val agentName: String? = null,
+    private val agentPrompt: String? = null,
     private val maxHistoryChars: Int = HistoryTrimmer.DEFAULT_MAX_CHARS,
 ) {
 
@@ -216,6 +221,20 @@ class OpenCodeAgent(
 
         val prompt = buildString {
             appendLine("You are opencode, an AI coding agent running inside the PocketRun app on Android. You help with code and files in the user's sandbox.")
+            if (agentPrompt != null) {
+                appendLine()
+                appendLine("# Agent: ${agentName ?: "custom"}")
+                appendLine(agentPrompt)
+            }
+            if (subagentType != null) {
+                appendLine()
+                appendLine("# Subagent (\"$subagentType\")")
+                appendLine("You were launched by another agent to handle ONE self-contained task. You cannot ask the user questions.")
+                if (subagentType == "explore") {
+                    appendLine("You are read-only: use read/list/glob/grep/webfetch to investigate and report. Do not try to edit files.")
+                }
+                appendLine("Work autonomously with the information given, then finish with a clear, self-contained report — the parent agent only sees your final message.")
+            }
             appendLine()
             appendLine("# Environment")
             appendLine("- Project directory: ${projectDir?.relativeToOrNull(workspace.root)?.path ?: "."} (relative paths in tools resolve there)")

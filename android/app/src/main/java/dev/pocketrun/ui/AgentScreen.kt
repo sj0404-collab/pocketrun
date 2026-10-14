@@ -85,6 +85,7 @@ fun AgentScreen(viewModel: AppViewModel) {
     val messages by viewModel.agentMessages.collectAsState()
     val running by viewModel.agentRunning.collectAsState()
     val config by viewModel.llmConfig.collectAsState()
+    val activeAgent by viewModel.activeAgent.collectAsState()
     val session by viewModel.currentSession.collectAsState()
     val todos by viewModel.todos.collectAsState()
     val pendingQuestion by viewModel.pendingQuestion.collectAsState()
@@ -94,6 +95,7 @@ fun AgentScreen(viewModel: AppViewModel) {
     val rounds by viewModel.agentRounds.collectAsState()
     val preview by viewModel.modelPreview.collectAsState()
     val turnStartedAt by viewModel.turnStartedAt.collectAsState()
+    val runningIds by viewModel.runningSessionIds.collectAsState()
 
     var input by remember { mutableStateOf("") }
     var showSettings by remember { mutableStateOf(false) }
@@ -143,6 +145,7 @@ fun AgentScreen(viewModel: AppViewModel) {
                             append(config.model)
                             append(" · ")
                             append(AgentSettings.MODE_LABELS[config.confirmMode] ?: config.confirmMode)
+                            if (activeAgent != null) append(" · @${activeAgent}")
                             if (config.hasGitHub) append(" · GitHub")
                         }
                     },
@@ -153,7 +156,6 @@ fun AgentScreen(viewModel: AppViewModel) {
             }
             IconButton(
                 onClick = { viewModel.refreshSessions(); showSessions = true },
-                enabled = !running,
             ) {
                 Icon(Icons.Filled.History, contentDescription = "Сессии")
             }
@@ -170,13 +172,13 @@ fun AgentScreen(viewModel: AppViewModel) {
             ) {
                 tabs.forEach { tab ->
                     val selected = tab.id == session?.id
+                    val tabRunning = tab.id in runningIds
                     FilterChip(
                         selected = selected,
                         onClick = { viewModel.switchTab(tab.id) },
-                        enabled = !running,
                         label = {
                             Text(
-                                (if (tab.parentID != null) "⑂ " else "") + tab.title.take(18),
+                                (if (tabRunning) "● " else "") + (if (tab.parentID != null) "⑂ " else "") + tab.title.take(18),
                                 maxLines = 1,
                                 style = MaterialTheme.typography.labelMedium,
                             )
@@ -184,16 +186,16 @@ fun AgentScreen(viewModel: AppViewModel) {
                         modifier = Modifier.padding(end = 6.dp),
                     )
                 }
-                IconButton(onClick = viewModel::newTab, enabled = !running) {
+                IconButton(onClick = viewModel::newTab) {
                     Icon(Icons.Filled.Add, contentDescription = "Новая вкладка", modifier = Modifier.size(18.dp))
                 }
                 if (session != null) {
-                    IconButton(onClick = viewModel::closeCurrentTab, enabled = !running && tabs.size > 0) {
+                    IconButton(onClick = viewModel::closeCurrentTab) {
                         Icon(Icons.Filled.Close, contentDescription = "Закрыть вкладку", modifier = Modifier.size(18.dp))
                     }
                 }
             }
-        } else if (!running) {
+        } else {
             TextButton(onClick = viewModel::newTab) {
                 Icon(Icons.Filled.Add, contentDescription = null, modifier = Modifier.size(16.dp))
                 Spacer(Modifier.width(4.dp))
@@ -271,7 +273,7 @@ fun AgentScreen(viewModel: AppViewModel) {
             val answering = pendingQuestion != null
             IconButton(
                 onClick = { filePicker.launch(arrayOf("*/*")) },
-                enabled = !running && !answering,
+                enabled = !answering,
             ) {
                 Icon(Icons.Filled.AttachFile, contentDescription = "Отправить файл агенту")
             }
@@ -280,9 +282,16 @@ fun AgentScreen(viewModel: AppViewModel) {
                 value = input,
                 onValueChange = { input = it },
                 modifier = Modifier.weight(1f),
-                placeholder = { Text(if (answering) "Ваш ответ агенту…" else "Спросите агента… /help — справка") },
+                placeholder = {
+                    Text(
+                        when {
+                            answering -> "Ваш ответ агенту…"
+                            running -> "Новое задание — откроется своя сессия…"
+                            else -> "Спросите агента… /help — справка"
+                        },
+                    )
+                },
                 maxLines = 4,
-                enabled = !running || answering,
             )
             Spacer(Modifier.width(8.dp))
             when {
@@ -301,11 +310,6 @@ fun AgentScreen(viewModel: AppViewModel) {
                         Icon(Icons.Filled.Stop, contentDescription = "Остановить")
                     }
                 }
-                running -> {
-                    Button(onClick = viewModel::cancelAgent) {
-                        Icon(Icons.Filled.Stop, contentDescription = "Остановить (сессия сохранится)")
-                    }
-                }
                 else -> {
                     Button(
                         onClick = {
@@ -315,6 +319,13 @@ fun AgentScreen(viewModel: AppViewModel) {
                         enabled = input.isNotBlank(),
                     ) {
                         Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Отправить")
+                    }
+                    // While this tab works, Stop cancels it — a new task still
+                    // goes to its own session (the send button above).
+                    if (running) {
+                        IconButton(onClick = viewModel::cancelAgent) {
+                            Icon(Icons.Filled.Stop, contentDescription = "Остановить (сессия сохранится)")
+                        }
                     }
                 }
             }
@@ -346,7 +357,8 @@ private fun AgentEmptyHint() {
     ) {
         Text(
             "opencode-совместимый агент: инструменты bash/read/write/edit/grep/glob,\n" +
-                "apply_patch, навыки, сессии с resume и fork, инструкции AGENTS.md.",
+                "apply_patch, навыки, сессии с resume и fork, инструкции AGENTS.md,\n" +
+                "субагенты (task) и параллельные сессии — новое задание на ходу откроет свою вкладку.",
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier.padding(horizontal = 16.dp),
