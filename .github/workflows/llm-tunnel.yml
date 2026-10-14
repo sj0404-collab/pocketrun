@@ -1,19 +1,14 @@
 name: Serve a small local LLM over tunnel.gg (ephemeral)
 
-# Run a small quantized model (Qwen 2.5 0.5B) on the GitHub runner and expose
-# it through tunnel.gg. The job stays alive up to the 6 hour Actions limit, so
-# PocketRun can use the printed URL as its baseUrl. CPU only -> slow.
+# Spin up Ollama on the GitHub runner and expose it via tunnel.gg, so PocketRun
+# can talk to a local (CPU) model. The job lives for up to 6 hours.
 on:
   workflow_dispatch:
     inputs:
-      model_url:
-        description: "GGUF model URL"
+      model:
+        description: "Ollama model"
         required: false
-        default: "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf"
-      context:
-        description: "Context size"
-        required: false
-        default: "2048"
+        default: "qwen2.5:0.5b"
 
 permissions:
   contents: read
@@ -21,47 +16,34 @@ permissions:
 jobs:
   serve:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 350
     steps:
-      - name: Download llama.cpp (Linux, CPU)
+      - name: Install Ollama
         run: |
           set -e
-          curl -L -o /tmp/llama.tar.gz \
-            https://github.com/ggerganov/llama.cpp/releases/download/b4191/llama-b4191-bin-ubuntu-x64.tar.gz || true
-          # fall back to latest release asset name if pinned tag is unavailable
-          if [ ! -s /tmp/llama.tar.gz ]; then
-            curl -L -o /tmp/llama.tar.gz https://github.com/ggerganov/llama.cpp/releases/latest/download/llama-bin-ubuntu-x64.tar.gz
-          fi
-          mkdir -p /tmp/llama && tar -xzf /tmp/llama.tar.gz -C /tmp/llama
-          find /tmp/llama -name "llama-server" -type f | head -1
+          curl -fsSL https://ollama.com/install.sh | sh
+          ollama --version
 
-      - name: Download model
+      - name: Start Ollama + pull model
         run: |
           set -e
-          curl -L -o /tmp/model.gguf "${{ inputs.model_url }}"
-          ls -lh /tmp/model.gguf
-
-      - name: Start OpenAI-compatible server + tunnel.gg
-        run: |
-          set -e
-          SERVER=$(find /tmp/llama -name "llama-server" -type f | head -1)
-          chmod +x "$SERVER"
-          "$SERVER" -m /tmp/model.gguf --host 0.0.0.0 --port 8080 -c ${{ inputs.context }} > /tmp/server.log 2>&1 &
-          # wait for readiness
-          for i in $(seq 1 60); do
-            curl -s http://127.0.0.1:8080/health >/dev/null 2>&1 && break
+          ollama serve > /tmp/ollama.log 2>&1 &
+          for i in $(seq 1 30); do
+            curl -s http://127.0.0.1:11434/api/tags >/dev/null 2>&1 && break
             sleep 2
           done
-          echo "=== server ready ==="
-          # open SSH reverse tunnel; prints public URL in the log
-          ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -t -R 80:localhost:8080 proxy.tunnl.gg > /tmp/tunnel.log 2>&1 &
-          TUNNEL_PID=$!
-          # give it time to print the URL
-          sleep 10
+          ollama pull "${{ inputs.model }}"
+          echo "=== model ready ==="
+
+      - name: Expose over tunnel.gg
+        run: |
+          set -e
+          ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -t -R 80:localhost:11434 proxy.tunnl.gg > /tmp/tunnel.log 2>&1 &
+          sleep 12
           echo "========== TUNNEL URL =========="
           cat /tmp/tunnel.log
           echo "==============================="
-          echo "Paste the printed https://....tunnl.gg URL into PocketRun: ⚙ -> baseUrl (no trailing /v1 needed; add /v1)."
-          echo "Model name in the app: the loaded GGUF (any string accepted by llama-server; usually 'gpt-3.5-turbo' alias)."
-          # stay alive up to 6 hours
-          sleep 21600
+          echo "Paste the URL into PocketRun: ⚙ -> baseUrl, then add /v1."
+          echo "Model name to enter in the app: ${{ inputs.model }}"
+          # stay alive as long as GitHub allows
+          sleep 20000
