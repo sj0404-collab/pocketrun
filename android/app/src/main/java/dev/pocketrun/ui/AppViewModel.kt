@@ -631,7 +631,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     AgentItem.Info(
                         "Команды: /new — новая сессия · /init — создать AGENTS.md · /continue — продолжить прерванный ход · /skills — список навыков · " +
                             "/agent <имя> — выбрать агента · /agents — список агентов · /models — модели · /sessions — сессии · /editor — открыть редактор · " +
-                            "/compact — сжать историю · /undo — отменить изменения последнего хода · /redo — вернуть отменённое · /share — поделиться сессией · /find — поиск по сессиям · /import — импорт сессии · /help — эта справка" +
+                            "/compact — сжать историю · /undo — отменить изменения последнего хода · /redo — вернуть отменённое · /share — поделиться сессией · /find — поиск по сессиям · /import — импорт сессии · /model — сменить модель · /models — модели · /help — эта справка" +
                             (if (custom.isNotEmpty()) " · свои команды: " + custom.joinToString(", ") { "/$it" } else "") + ".\n\n" +
                             "Свои команды: opencode.json → command, или файл .opencode/command/<имя>.md (frontmatter description/agent/model + шаблон с \$ARGUMENTS, \$1…\$9 и @файл).\n" +
                             "Агенты: opencode.json → agent, или .opencode/agent/<имя>.md (frontmatter description/model/tools/mode + промпт в теле).\n" +
@@ -725,6 +725,17 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     }
                     return
                 }
+                "model" -> {
+                    ensureSession()
+                    val id = args.trim()
+                    if (id.isEmpty()) {
+                        pushItem(AgentItem.Info("Текущая модель: ${_llmConfig.value.model}. Смена: /model <id>."))
+                        return
+                    }
+                    saveLlmConfig(_llmConfig.value.copy(model = id.trim()))
+                    pushItem(AgentItem.Info("Модель: ${_llmConfig.value.model}"))
+                    return
+                }
                 "compact" -> {
                     ensureSession()
                     compactSession()
@@ -737,6 +748,25 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 "models" -> {
                     ensureSession()
                     val cfg = openCodeConfig()
+                    if (args.trim() == "hf") {
+                        pushItem(AgentItem.Info("Загружаю каталог HuggingFace…"))
+                        ioExecutor.execute {
+                            val baseUrl = "https://router.huggingface.co/v1"
+                            val key = _llmConfig.value.apiKey
+                            val listed = try { LlmClient.models(baseUrl, key) } catch (t: Throwable) { emptyList() }
+                            val text = if (listed.isEmpty()) {
+                                "Не удалось получить список моделей. Укажите модель вручную: /model <id>. "
+                            } else {
+                                buildString {
+                                    appendLine("HuggingFace: ${listed.size} моделей")
+                                    listed.take(60).forEach { appendLine("• $it") }
+                                    append("Сменить: /model <id> или ⚙.")
+                                }
+                            }
+                            pushItem(AgentItem.Info(text))
+                        }
+                        return
+                    }
                     if (args.trim() == "dev") {
                         pushItem(AgentItem.Info("Загружаю каталог models.dev…"))
                         ioExecutor.execute {

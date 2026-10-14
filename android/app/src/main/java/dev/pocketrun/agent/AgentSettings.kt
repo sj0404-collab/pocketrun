@@ -46,7 +46,7 @@ object AgentSettings {
         Preset("OpenCode Zen", ZEN_BASE_URL, "claude-sonnet-4-5"),
         Preset("OpenAI", "https://api.openai.com/v1", "gpt-4o-mini"),
         Preset("OpenRouter", "https://openrouter.ai/api/v1", "anthropic/claude-sonnet-4.5"),
-        Preset("Groq", "https://api.groq.com/openai/v1", "llama-3.3-70b-versatile"),
+        Preset("HuggingFace", "https://router.huggingface.co/v1", ""),
     )
 
     data class Config(

@@ -410,6 +410,7 @@ fun AgentScreen(viewModel: AppViewModel) {
                     "/continue" to "продолжить прерванный ход",
                     "/agent" to "выбрать агента",
                     "/agents" to "список агентов",
+                    "/model" to "сменить модель",
                     "/models" to "модели",
                     "/sessions" to "сессии",
                     "/skills" to "навыки",
