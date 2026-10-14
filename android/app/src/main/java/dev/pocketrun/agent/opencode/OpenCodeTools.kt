@@ -33,18 +33,43 @@ class OpenCodeTools(
         /** A single bash command may run this long — npm installs and builds need it. */
         const val BASH_TIMEOUT_MS = 300_000L
 
+        /** Every tool the agent can be offered (used to apply global disables). */
+        val ALL_TOOLS: Set<String> = setOf(
+            "bash", "read", "write", "edit", "list", "glob", "grep", "apply_patch",
+            "todowrite", "todoread", "webfetch", "websearch", "skill", "question",
+            "github", "task",
+        )
+
         /** Tools a subagent of [type] may use (subagents cannot ask or nest). */
         fun subagentTools(type: String): Set<String> = when (type) {
-            "explore" -> setOf("read", "list", "glob", "grep", "webfetch")
+            "explore" -> setOf("read", "list", "glob", "grep", "webfetch", "websearch")
             else -> setOf(
                 "bash", "read", "write", "edit", "list", "glob", "grep",
-                "apply_patch", "todowrite", "webfetch", "skill", "github",
+                "apply_patch", "todowrite", "todoread", "webfetch", "websearch", "skill", "github",
             )
         }
     }
 
     private val shell = MiniShell(workspace, jsRuntime, npxRuntime, busybox)
     private val skills = Skills(workspace)
+
+    /** `.gitignore`/`.ignore` rules for the project root, used by glob/grep/list. */
+    private val ignore: Ignore by lazy { Ignore.load(projectDir, File(workspace.root, "opencode")) }
+
+    /** True when a path (relative to [base]) should be hidden from searches. */
+    private fun hidden(f: File, isDir: Boolean): Boolean {
+        val root = base()
+        val rel = f.relativeToOrNull(root)?.path ?: return false
+        if (ignore.isIgnored(rel, isDir)) return true
+        // An ignored parent directory hides everything below it.
+        var parent = f.parentFile
+        while (parent != null && parent.path.length > root.path.length) {
+            val prel = parent.relativeToOrNull(root)?.path ?: break
+            if (ignore.isIgnored(prel, true)) return true
+            parent = parent.parentFile
+        }
+        return false
+    }
 
     /** Answers pending questions; set by the agent runner. */
     @Volatile
@@ -83,6 +108,12 @@ class OpenCodeTools(
      */
     @Volatile
     var onBeforeWrite: ((File) -> Unit)? = null
+
+    /**
+     * Formatters declared in opencode.json; each runs after a file is written
+     * and its output is reported back to the agent when it fails.
+     */
+    var formatters: List<OpenCodeConfig.FormatterDef> = emptyList()
 
     /** The current todo list; seeded from the session before each turn. */
     var todos: List<Sessions.Todo> = emptyList()
@@ -226,10 +257,23 @@ class OpenCodeTools(
             listOf("todos"),
         )
         tool(
+            "todoread",
+            "Read the current session todo list.",
+            JSONObject(),
+            emptyList(),
+        )
+        tool(
             "webfetch",
             "Fetch an http(s) URL and return the page as plain text (HTML stripped), max ${MAX_WEB} chars.",
             JSONObject().put("url", str("url", "the URL to fetch")),
             listOf("url"),
+        )
+        tool(
+            "websearch",
+            "Search the web (DuckDuckGo) and return the top results as title, URL and snippet. " +
+                "Use it to find current information, then webfetch the promising URLs for detail.",
+            JSONObject().put("query", str("query", "the search query")),
+            listOf("query"),
         )
         tool(
             "skill",
@@ -344,7 +388,9 @@ class OpenCodeTools(
                 "grep" -> doGrep(args)
                 "apply_patch" -> doApplyPatch(args)
                 "todowrite" -> doTodoWrite(args)
+                "todoread" -> doTodoRead()
                 "webfetch" -> doWebFetch(args)
+                "websearch" -> doWebSearch(args)
                 "skill" -> doSkill(args)
                 "question" -> doQuestion(args)
                 "github" -> doGitHub(args)
@@ -358,7 +404,7 @@ class OpenCodeTools(
 
     /** True when the call cannot change anything (auto-approved in manual mode). */
     fun isReadOnly(name: String, args: JSONObject): Boolean = when (name) {
-        "read", "list", "glob", "grep", "webfetch", "skill", "question", "todowrite" -> true
+        "read", "list", "glob", "grep", "webfetch", "websearch", "skill", "question", "todowrite", "todoread" -> true
         "github" -> args.optString("op") in GitHubClient.READ_OPS
         else -> false
     }
@@ -389,7 +435,7 @@ class OpenCodeTools(
         val from = (offset - 1).coerceIn(0, lines.size)
         val to = if (limit > 0) minOf(from + limit, lines.size) else lines.size
         val picked = lines.subList(from, to)
-        val body = picked.joinToString("\n")
+        val body = picked.mapIndexed { i, line -> "${from + i + 1}: $line" }.joinToString("\n")
         return (body.take(MAX_READ) + if (body.length > MAX_READ) "\n… (обрезано)" else "")
             .ifEmpty { "(пустой файл)" }
     }
@@ -401,7 +447,8 @@ class OpenCodeTools(
         f.parentFile?.mkdirs()
         onBeforeWrite?.invoke(f)
         f.writeText(args.optString("content", ""), Charsets.UTF_8)
-        return "wrote ${args.optString("content", "").length} chars to ${workspace.relativeTo(f)}"
+        val note = formatFile(f)
+        return "wrote ${args.optString("content", "").length} chars to ${workspace.relativeTo(f)}" + (note?.let { " ($it)" } ?: "")
     }
 
     private fun doEdit(args: JSONObject): String {
@@ -419,7 +466,8 @@ class OpenCodeTools(
         val updated = if (args.optBoolean("replaceAll", false)) text.replace(old, new) else text.replaceFirst(old, new)
         onBeforeWrite?.invoke(f)
         f.writeText(updated, Charsets.UTF_8)
-        return "ok: заменено вхождений: ${if (args.optBoolean("replaceAll", false)) count else 1}"
+        val note = formatFile(f)
+        return "ok: заменено вхождений: ${if (args.optBoolean("replaceAll", false)) count else 1}" + (note?.let { " ($it)" } ?: "")
     }
 
     private fun doList(args: JSONObject): String {
@@ -427,7 +475,10 @@ class OpenCodeTools(
         val dir = resolve(path) ?: return "error: путь вне песочницы"
         if (!dir.exists()) return "error: нет такого каталога: $path"
         if (!dir.isDirectory) return "error: не каталог: $path"
-        val entries = dir.listFiles()?.sortedWith(compareByDescending<File> { it.isDirectory }.thenBy { it.name }) ?: return "(empty)"
+        val entries = dir.listFiles()
+            ?.filter { !hidden(it, it.isDirectory) }
+            ?.sortedWith(compareByDescending<File> { it.isDirectory }.thenBy { it.name })
+            ?: return "(empty)"
         if (entries.isEmpty()) return "(empty)"
         return entries.take(200).joinToString("\n") { f -> if (f.isDirectory) f.name + "/" else f.name + " (${f.length()} bytes)" }
     }
@@ -436,11 +487,12 @@ class OpenCodeTools(
         val pattern = args.getString("pattern")
         val dir = resolve(args.optString("path", ".")) ?: return "error: путь вне песочницы"
         val base = dir.takeIf { it.isDirectory } ?: workspace.root
+        val regex = globToRegex(pattern)
         val matches = mutableListOf<File>()
         base.walkTopDown().forEach { f ->
-            if (f.isFile) {
+            if (f.isFile && !hidden(f, false)) {
                 val rel = f.relativeToOrNull(base)?.path ?: return@forEach
-                if (globToRegex(pattern).matches(rel)) matches += f
+                if (regex.matches(rel)) matches += f
             }
         }
         if (matches.isEmpty()) return "(нет совпадений)"
@@ -458,6 +510,7 @@ class OpenCodeTools(
         base.walkTopDown().forEach { f ->
             if (out.length > MAX_TOOL_OUTPUT) return@forEach
             if (!f.isFile || f.length() > 512 * 1024) return@forEach
+            if (hidden(f, false)) return@forEach
             val rel = workspace.relativeTo(f)
             if (include != null && !include.matches(f.name) && !include.matches(rel)) return@forEach
             val text = runCatching { f.readText(Charsets.UTF_8) }.getOrNull() ?: return@forEach
@@ -470,14 +523,38 @@ class OpenCodeTools(
 
     private fun doApplyPatch(args: JSONObject): String {
         return try {
-            val result = ApplyPatch.apply(args.getString("patchText"), { path -> resolve(path) }, onBeforeWrite)
+            val notes = mutableListOf<String>()
+            val result = ApplyPatch.apply(
+                args.getString("patchText"),
+                { path -> resolve(path) },
+                onBeforeWrite,
+                { f -> formatFile(f)?.let { notes += it } },
+            )
             buildString {
                 if (result.applied.isNotEmpty()) appendLine(result.applied.joinToString("\n"))
                 if (result.skipped.isNotEmpty()) appendLine("skipped: " + result.skipped.joinToString("; "))
+                if (notes.isNotEmpty()) appendLine(notes.joinToString("; "))
             }.trim().ifEmpty { "патч не содержал операций" }
         } catch (e: ApplyPatch.PatchException) {
             "error: ${e.message}"
         }
+    }
+
+    /** Runs the configured formatter(s) for [f]; returns a note on failure, else null. */
+    private fun formatFile(f: File): String? {
+        if (formatters.isEmpty()) return null
+        val root = base()
+        val rel = f.relativeToOrNull(root)?.path ?: return null
+        val ext = f.extension.lowercase()
+        val notes = mutableListOf<String>()
+        for (fmt in formatters) {
+            if (fmt.extensions.isNotEmpty() && ext !in fmt.extensions.map { it.removePrefix(".").lowercase() }) continue
+            val quoted = "'" + rel.replace("'", "'\\''") + "'"
+            val cmd = fmt.command.joinToString(" ") { if (it == "\$FILE") quoted else it }
+            val out = runCatching { shell.execute(cmd, root, 60_000) }.getOrNull() ?: continue
+            if (out.exitCode != 0) notes += "форматтер ${fmt.name} (код ${out.exitCode}): ${out.output.trim().take(200)}"
+        }
+        return notes.takeIf { it.isNotEmpty() }?.joinToString("; ")
     }
 
     private fun doTodoWrite(args: JSONObject): String {
@@ -499,6 +576,11 @@ class OpenCodeTools(
         return "todos updated: ${list.size}"
     }
 
+    private fun doTodoRead(): String {
+        if (todos.isEmpty()) return "(список пуст)"
+        return todos.joinToString("\n") { "[${it.status}] ${it.content}" }
+    }
+
     private fun doWebFetch(args: JSONObject): String {
         val url = args.getString("url")
         if (!url.startsWith("http://") && !url.startsWith("https://")) return "error: только http(s) URL"
@@ -516,6 +598,63 @@ class OpenCodeTools(
             text.take(MAX_WEB).ifEmpty { "(пустой ответ)" }
         } catch (t: Throwable) {
             "error: ${t.message ?: t.javaClass.simpleName}"
+        }
+    }
+
+    private fun doWebSearch(args: JSONObject): String {
+        val query = args.optString("query").trim()
+        if (query.isEmpty()) return "error: пустой запрос"
+        val encoded = java.net.URLEncoder.encode(query, "UTF-8")
+        val url = "https://html.duckduckgo.com/html/?q=$encoded"
+        return try {
+            val conn = URL(url).openConnection() as HttpURLConnection
+            conn.connectTimeout = 10_000
+            conn.readTimeout = 30_000
+            conn.instanceFollowRedirects = true
+            conn.setRequestProperty("User-Agent", "Mozilla/5.0 (compatible; PocketRunAgent/1.3)")
+            conn.setRequestProperty("Accept-Language", "ru,en;q=0.8")
+            val status = conn.responseCode
+            val body = (if (status in 200..299) conn.inputStream else conn.errorStream)
+                ?.bufferedReader(Charsets.UTF_8)?.use { it.readText() } ?: ""
+            if (status !in 200..299) return "HTTP $status: ${body.take(300)}"
+            parseSearchResults(body)
+        } catch (t: Throwable) {
+            "error: ${t.message ?: t.javaClass.simpleName}"
+        }
+    }
+
+    private fun parseSearchResults(html: String): String {
+        val linkRegex = Regex(
+            """<a[^>]*class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>(.*?)</a>""",
+            setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE),
+        )
+        val snippetRegex = Regex(
+            """<(?:a|td)[^>]*class="[^"]*result__snippet[^"]*"[^>]*>(.*?)</(?:a|td)>""",
+            setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE),
+        )
+        val links = linkRegex.findAll(html).toList()
+        if (links.isEmpty()) return "(ничего не найдено)"
+        val snippets = snippetRegex.findAll(html).map { stripHtml(it.groupValues[1]).trim() }.toList()
+        return links.take(8).mapIndexed { i, m ->
+            val rawHref = m.groupValues[1]
+            val title = stripHtml(m.groupValues[2]).trim()
+            val link = decodeResultUrl(rawHref)
+            val snippet = snippets.getOrNull(i).orEmpty()
+            buildString {
+                append("${i + 1}. $title")
+                append("\n   $link")
+                if (snippet.isNotBlank()) append("\n   ${snippet.take(300)}")
+            }
+        }.joinToString("\n\n").take(MAX_WEB)
+    }
+
+    /** DuckDuckGo wraps result links in a /l/?uddg=<url> redirect. */
+    private fun decodeResultUrl(href: String): String {
+        val target = Regex("[?&]uddg=([^&]+)").find(href)?.groupValues?.get(1) ?: return href
+        return try {
+            java.net.URLDecoder.decode(target, "UTF-8")
+        } catch (t: Throwable) {
+            href
         }
     }
 

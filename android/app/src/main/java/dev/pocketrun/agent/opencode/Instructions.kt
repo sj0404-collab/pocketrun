@@ -50,8 +50,8 @@ class Instructions(private val workspace: Workspace) {
             if (entry.startsWith("http://") || entry.startsWith("https://")) {
                 fetchRemote(entry)?.let { parts += entry to it }
             } else {
-                val f = resolveInstructionPath(entry, projectDir) ?: continue
-                if (f.isFile) {
+                for (f in resolveInstructionFiles(entry, projectDir)) {
+                    if (!f.isFile) continue
                     val text = f.readText(Charsets.UTF_8).trim()
                     if (text.isNotEmpty()) parts += workspace.relativeTo(f) to text
                 }
@@ -85,19 +85,58 @@ class Instructions(private val workspace: Workspace) {
         }
     }
 
-    /** Supports glob-ish entries (a directory plus `*.md`) via a simple scan. */
-    private fun resolveInstructionPath(entry: String, projectDir: File?): File? {
-        if (entry.endsWith("/*") || entry.endsWith("/*.md")) {
-            val parent = entry.removeSuffix("*").removeSuffix("/")
-            val base = workspace.resolve(parent, projectDir ?: workspace.root) ?: return null
-            if (!base.isDirectory) return null
-            val files = base.listFiles { f -> f.isFile && f.name.endsWith(".md") } ?: return null
-            // combined into one pseudo-file: return the first; others handled by caller loop
-            // — simpler: create a synthetic marker by concatenating at collect() level
-            // For now single-file entries cover the common case; glob entries use the first match.
-            return files.sortedBy { it.name }.firstOrNull()
+    /**
+     * Resolves a config `instructions` entry to one or more files. A plain path
+     * resolves directly; glob entries (`*.md`, `docs/**/*.md`) are matched
+     * against the project directory and the workspace root.
+     */
+    private fun resolveInstructionFiles(entry: String, projectDir: File?): List<File> {
+        if (entry.none { it == '*' || it == '?' }) {
+            return listOfNotNull(workspace.resolve(entry, projectDir ?: workspace.root))
         }
-        return workspace.resolve(entry, projectDir ?: workspace.root)
+        val regex = globToRegex(entry)
+        val roots = listOfNotNull(projectDir, workspace.root).distinct()
+        val out = LinkedHashMap<String, File>()
+        for (root in roots) {
+            var seen = 0
+            root.walkTopDown().forEach { f ->
+                if (seen > 20_000) return@forEach
+                seen++
+                if (!f.isFile) return@forEach
+                val rel = f.relativeToOrNull(root)?.path ?: return@forEach
+                if (regex.matches(rel)) out.putIfAbsent(f.canonicalPath, f)
+            }
+        }
+        return out.values.sortedBy { it.path }
+    }
+
+    /** `**` crosses directories, `*`/`?` stay within one path segment. */
+    private fun globToRegex(pattern: String): Regex {
+        val regex = buildString {
+            append('^')
+            var i = 0
+            while (i < pattern.length) {
+                val c = pattern[i]
+                when {
+                    c == '*' && i + 1 < pattern.length && pattern[i + 1] == '*' -> {
+                        if (i + 2 < pattern.length && pattern[i + 2] == '/') {
+                            append("(?:.*/)?")
+                            i += 2
+                        } else {
+                            append(".*")
+                            i++
+                        }
+                    }
+                    c == '*' -> append("[^/]*")
+                    c == '?' -> append("[^/]")
+                    c in "\\^$.|+()[]{}" -> { append('\\'); append(c) }
+                    else -> append(c)
+                }
+                i++
+            }
+            append('$')
+        }
+        return Regex(regex)
     }
 
     private fun fetchRemote(url: String): String? = try {

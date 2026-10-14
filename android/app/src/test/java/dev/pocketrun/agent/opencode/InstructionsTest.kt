@@ -93,4 +93,35 @@ class InstructionsTest {
         assertEquals("", r.text)
         assertTrue(r.sources.isEmpty())
     }
+
+    @Test
+    fun globInstructionEntryMatchesMultipleFiles() {
+        val ws = newWorkspace()
+        val project = File(ws.root, "projects/demo")
+        File(project, "docs").mkdirs()
+        File(project, "docs/a.md").writeText("Док A.")
+        File(project, "docs/b.md").writeText("Док B.")
+        File(ws.root, "opencode").mkdirs()
+        File(ws.root, "opencode/opencode.json").writeText("""{"instructions": ["docs/*.md"]}""")
+
+        val r = Instructions(ws).collect(project)
+        assertTrue(r.text.contains("Док A."))
+        assertTrue(r.text.contains("Док B."))
+        assertEquals(2, r.sources.size)
+    }
+
+    @Test
+    fun doubleStarInstructionEntryCrossesDirectories() {
+        val ws = newWorkspace()
+        val project = File(ws.root, "projects/demo")
+        File(project, "docs/deep").mkdirs()
+        File(project, "docs/top.md").writeText("Верхний.")
+        File(project, "docs/deep/nested.md").writeText("Вложенный.")
+        File(ws.root, "opencode").mkdirs()
+        File(ws.root, "opencode/opencode.json").writeText("""{"instructions": ["docs/**/*.md"]}""")
+
+        val r = Instructions(ws).collect(project)
+        assertTrue(r.text.contains("Верхний."))
+        assertTrue(r.text.contains("Вложенный."))
+    }
 }

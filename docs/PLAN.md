@@ -310,7 +310,32 @@ Rhino-фолбэк (когда нативного лаунчера нет, на�
 * слэш-команды чата: `/agent <имя>`, `/agents`, `/models`, `/sessions`,
   `/editor`, `/compact` (сжатие истории моделью), `/undo` (откат файлов
   последнего хода — `write`/`edit`/`apply_patch`, через `FileHistory`),
-  плюс прежние `/new`, `/init`, `/continue`, `/skills`, `/help`.
+  `/redo` (возврат отменённого `/undo`), `/share` (экспорт сессии в JSON и
+  системный «поделиться»), плюс прежние `/new`, `/init`, `/continue`,
+  `/skills`, `/help`.
+
+### 4.8 Инструменты, провайдеры, форматтеры ✅ готово
+
+* **Инструменты.** К агенту добавлены `websearch` (поиск через
+  `html.duckduckgo.com`) и `todoread`; `read` отдаёт строки с номерами;
+  `list`/`glob`/`grep` уважают `.gitignore`/`.ignore` (`agent/opencode/Ignore.kt`).
+  Глобально инструменты выключаются в `opencode.json` → `tools`
+  (`{"websearch": false, "write": "off"}`): набор пересекается с
+  `OpenCodeTools.ALL_TOOLS` в `AppViewModel`.
+* **Провайдеры.** `opencode.json` → `provider` (`baseURL`, `apiKey`, `models`).
+  Модель вида `provider/model` (или совпавшая с объявленной) заставляет ход
+  использовать endpoint и ключ этого провайдера (`OpenCodeConfig.providerFor`).
+  Каталог `models.dev` — `agent/opencode/ModelsDev.kt`, кэш в
+  `workspace/opencode/cache/models-dev.json`, команда `/models dev`.
+* **Параметры модели на агента.** `temperature`, `top_p`, `max_tokens`,
+  `reasoning_effort` в `agent` (JSON `options` или frontmatter) и в
+  настройках приложения; `LlmClient` подставляет их в запрос.
+* **Форматтеры.** `opencode.json` → `formatter`
+  (`{"prettier": {"command": ["npx","prettier","--write","$FILE"], "extensions": [".ts"]}}`);
+  запускаются после успешной записи `write`/`edit`/`apply_patch`, ошибка
+  возвращается агенту.
+* **Инструкции.** `Instructions` раскрывает glob-записи в `instructions`
+  (`*.md`, `docs/**/*.md`) — раньше брался только первый файл.
 
 ---
 
@@ -349,3 +374,8 @@ tools/keygen/gradlew -p tools/keygen run --args="issue --name 'Jane Doe' --seat 
   (~50 МБ на ABI в сжатом виде); сборка ограничена `arm64-v8a` и `x86_64`.
 * **Rhino-фолбэк ограничен** — если нативный лаунчер недоступен, `node`
   деградирует до ES6-слоя без class/async/import.
+* **MCP, плагины и пользовательские инструменты opencode не поддержаны.**
+  MCP требует долгоживущего процесса с обменом по stdio, а рантайм устройства
+  запускает команды одним вызовом; плагины/кастомные инструменты opencode —
+  это TS-модули с хук-API, которого у нас нет. Эти вещи честно отсутствуют,
+  а не эмулируются.

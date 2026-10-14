@@ -28,7 +28,12 @@ object ApplyPatch {
 
     data class PatchResult(val applied: List<String>, val skipped: List<String>)
 
-    fun apply(patchText: String, resolve: (String) -> File?, onBeforeWrite: ((File) -> Unit)? = null): PatchResult {
+    fun apply(
+        patchText: String,
+        resolve: (String) -> File?,
+        onBeforeWrite: ((File) -> Unit)? = null,
+        onAfterWrite: ((File) -> Unit)? = null,
+    ): PatchResult {
         val rawLines = patchText.lines()
         if (rawLines.firstOrNull()?.trim() != "*** Begin Patch") {
             throw PatchException("патч должен начинаться с '*** Begin Patch'")
@@ -67,6 +72,7 @@ object ApplyPatch {
                     f.parentFile?.mkdirs()
                     onBeforeWrite?.invoke(f)
                     f.writeText(content.toString(), Charsets.UTF_8)
+                    onAfterWrite?.invoke(f)
                     applied += "add $path"
                 }
                 line.trimStart().startsWith("*** Update File:") -> {
@@ -115,6 +121,7 @@ object ApplyPatch {
                         target.parentFile?.mkdirs()
                     }
                     target.writeText(updated, Charsets.UTF_8)
+                    onAfterWrite?.invoke(target)
                     applied += if (moveTo != null) "update $path → $moveTo" else "update $path"
                 }
                 line.trimStart().startsWith("*** Delete File:") -> {

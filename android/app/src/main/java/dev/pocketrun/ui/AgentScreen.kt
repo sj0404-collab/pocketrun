@@ -38,6 +38,8 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.History
+import androidx.compose.material.icons.filled.Menu
+import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material3.AlertDialog
@@ -100,6 +102,8 @@ fun AgentScreen(viewModel: AppViewModel) {
     var input by remember { mutableStateOf("") }
     var showSettings by remember { mutableStateOf(false) }
     var showSessions by remember { mutableStateOf(false) }
+    var showAgentPicker by remember { mutableStateOf(false) }
+    var showCommandPicker by remember { mutableStateOf(false) }
 
     // Live "m:ss" ticker while the agent works.
     var elapsed by remember { mutableStateOf(0L) }
@@ -277,6 +281,18 @@ fun AgentScreen(viewModel: AppViewModel) {
             ) {
                 Icon(Icons.Filled.AttachFile, contentDescription = "Отправить файл агенту")
             }
+            IconButton(
+                onClick = { showAgentPicker = true },
+                enabled = !answering,
+            ) {
+                Icon(Icons.Filled.Person, contentDescription = "Выбрать агента")
+            }
+            IconButton(
+                onClick = { showCommandPicker = true },
+                enabled = !answering,
+            ) {
+                Icon(Icons.Filled.Menu, contentDescription = "Команды")
+            }
             Spacer(Modifier.width(4.dp))
             OutlinedTextField(
                 value = input,
@@ -347,6 +363,96 @@ fun AgentScreen(viewModel: AppViewModel) {
             onSave = { viewModel.saveLlmConfig(it); showSettings = false },
         )
     }
+
+    if (showAgentPicker) {
+        val cfg = viewModel.openCodeConfig()
+        PickerDialog(
+            title = "Агент",
+            items = buildList {
+                add("build" to "по умолчанию")
+                add("plan" to "планирование")
+                add("explore" to "разведка")
+                add("general" to "общий")
+                cfg.agentNames().forEach { n ->
+                    val d = cfg.agent(n)
+                    add(n to listOfNotNull(d?.mode, d?.description?.takeIf { it.isNotBlank() }).joinToString(" · "))
+                }
+            },
+            current = viewModel.activeAgent.value ?: "build",
+            onDismiss = { showAgentPicker = false },
+            onPick = { name ->
+                viewModel.sendToAgent("/agent $name")
+                showAgentPicker = false
+            },
+        )
+    }
+
+    if (showCommandPicker) {
+        val cfg = viewModel.openCodeConfig()
+        PickerDialog(
+            title = "Команды",
+            items = buildList {
+                listOf(
+                    "/help" to "справка",
+                    "/new" to "новая сессия",
+                    "/init" to "создать AGENTS.md",
+                    "/continue" to "продолжить прерванный ход",
+                    "/agent" to "выбрать агента",
+                    "/agents" to "список агентов",
+                    "/models" to "модели",
+                    "/sessions" to "сессии",
+                    "/skills" to "навыки",
+                    "/compact" to "сжать историю",
+                    "/undo" to "отменить изменения хода",
+                    "/redo" to "вернуть отменённое",
+                    "/share" to "поделиться сессией",
+                    "/editor" to "открыть редактор",
+                ).forEach { add(it) }
+                cfg.commandNames().forEach { add("/$it" to "своя команда") }
+            },
+            current = null,
+            onDismiss = { showCommandPicker = false },
+            onPick = { cmd ->
+                input = cmd.trim() + " "
+                showCommandPicker = false
+            },
+        )
+    }
+}
+
+@Composable
+private fun PickerDialog(
+    title: String,
+    items: List<Pair<String, String>>,
+    current: String?,
+    onDismiss: () -> Unit,
+    onPick: (String) -> Unit,
+) {
+    androidx.compose.material3.AlertDialog(
+        onDismissRequest = onDismiss,
+        confirmButton = {
+            androidx.compose.material3.TextButton(onClick = onDismiss) { Text("Закрыть") }
+        },
+        title = { Text(title) },
+        text = {
+            androidx.compose.foundation.lazy.LazyColumn(
+                modifier = Modifier.heightIn(max = 420.dp),
+            ) {
+                items(items) { (value, hint) ->
+                    val mark = if (value == current) "● " else "• "
+                    androidx.compose.material3.TextButton(
+                        onClick = { onPick(value) },
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text(
+                            text = mark + value + (if (hint.isNotBlank()) " — $hint" else ""),
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                    }
+                }
+            }
+        },
+    )
 }
 
 @Composable

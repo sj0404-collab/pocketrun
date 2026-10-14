@@ -277,6 +277,13 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         val turnCreated = mutableListOf<File>()
         val turnFiles = mutableSetOf<String>()
 
+        /**
+         * Redo support for `/redo`: the post-turn version of every file the last
+         * undo reverted, and the contents of every created file it deleted.
+         */
+        val redoSnapshots = mutableListOf<Pair<File, Version>>()
+        val redoCreated = mutableListOf<Pair<File, String>>()
+
         /** Unblocks whoever is waiting on a question/approval when the turn stops. */
         fun release() {
             pendingQuestion.value?.answer?.invoke("(отменено пользователем)")
@@ -602,11 +609,14 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     AgentItem.Info(
                         "Команды: /new — новая сессия · /init — создать AGENTS.md · /continue — продолжить прерванный ход · /skills — список навыков · " +
                             "/agent <имя> — выбрать агента · /agents — список агентов · /models — модели · /sessions — сессии · /editor — открыть редактор · " +
-                            "/compact — сжать историю · /undo — отменить изменения последнего хода · /help — эта справка" +
+                            "/compact — сжать историю · /undo — отменить изменения последнего хода · /redo — вернуть отменённое · /share — поделиться сессией · /help — эта справка" +
                             (if (custom.isNotEmpty()) " · свои команды: " + custom.joinToString(", ") { "/$it" } else "") + ".\n\n" +
                             "Свои команды: opencode.json → command, или файл .opencode/command/<имя>.md (frontmatter description/agent/model + шаблон с \$ARGUMENTS, \$1…\$9 и @файл).\n" +
                             "Агенты: opencode.json → agent, или .opencode/agent/<имя>.md (frontmatter description/model/tools/mode + промпт в теле).\n" +
                             "Права: opencode.json → permission (allow/ask/deny, для bash — с шаблонами вроде \"rm *\": \"deny\").\n\n" +
+                            "Отключить инструменты глобально: opencode.json → tools (например {\"websearch\": false}).\n" +
+                            "Свои провайдеры: opencode.json → provider (baseURL, apiKey, models) — модель вида provider/model возьмёт их. Каталог моделей: /models dev.\n" +
+                            "Форматтеры: opencode.json → formatter ({\"prettier\": {\"command\": [\"npx\",\"prettier\",\"--write\",\"\$FILE\"]}}) — запускаются после записи файла.\n" +
                             "Новое задание, пока агент занят, открывает отдельную сессию и выполняется параллельно — вкладки сверху.\n" +
                             "Навыки: создайте .opencode/skills/<имя>/SKILL.md (frontmatter: name, description) — агент подхватит и сможет загружать; глобальные — workspace/opencode/skills/.\n" +
                             "Инструкции: AGENTS.md в проекте + глобальный opencode/AGENTS.md, фолбэк CLAUDE.md; список файлов/URL — в opencode/opencode.json (\"instructions\").\n" +
@@ -630,6 +640,27 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     undoLastTurn()
                     return
                 }
+                "redo" -> {
+                    ensureSession()
+                    redoLastTurn()
+                    return
+                }
+                "share" -> {
+                    ensureSession()
+                    val id = args.trim().takeIf { it.isNotEmpty() } ?: _currentSession.value?.id
+                    if (id == null) {
+                        pushItem(AgentItem.Info("Нет активной сессии."))
+                        return
+                    }
+                    val path = sessions.export(id)
+                    if (path == null) {
+                        pushItem(AgentItem.Error("Не удалось экспортировать сессию."))
+                    } else {
+                        pushItem(AgentItem.Info("Сессия экспортирована: $path"))
+                        shareFile(File(path))
+                    }
+                    return
+                }
                 "compact" -> {
                     ensureSession()
                     compactSession()
@@ -641,14 +672,46 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 }
                 "models" -> {
                     ensureSession()
+                    val cfg = openCodeConfig()
+                    if (args.trim() == "dev") {
+                        pushItem(AgentItem.Info("Загружаю каталог models.dev…"))
+                        ioExecutor.execute {
+                            val catalog = dev.pocketrun.agent.opencode.ModelsDev.load(File(workspace.root, "opencode/cache"))
+                            val text = if (catalog.isEmpty()) {
+                                "Не удалось загрузить models.dev (нет сети?)."
+                            } else {
+                                buildString {
+                                    appendLine("models.dev: ${catalog.size} провайдеров")
+                                    catalog.values.take(40).forEach { p ->
+                                        appendLine("• ${p.id} (${p.name}) — ${p.models.size} моделей")
+                                    }
+                                    if (catalog.size > 40) appendLine("…")
+                                    append("Пример: ${catalog.values.firstOrNull()?.models?.take(8)?.joinToString { it.id } ?: "—"}")
+                                }
+                            }
+                            pushItem(AgentItem.Info(text))
+                        }
+                        return
+                    }
                     val current = _llmConfig.value.model
                     val listed = _modelCatalog.value
-                    val body = if (listed.isEmpty()) {
-                        "Текущая: $current\nПресеты:\n" + AgentSettings.PRESETS.joinToString("\n") { "• ${it.label} — ${it.model}" }
-                    } else {
-                        "Текущая: $current\nДоступные на сервере:\n" + listed.take(50).joinToString("\n") { "• $it" }
+                    val text = buildString {
+                        appendLine("Текущая: $current")
+                        if (cfg.providers.isNotEmpty()) {
+                            appendLine("Провайдеры из opencode.json:")
+                            cfg.providers.values.forEach { p ->
+                                appendLine("• ${p.id}${p.baseUrl?.let { " → $it" } ?: ""}${if (p.models.isNotEmpty()) " (${p.models.joinToString(", ")})" else ""}")
+                            }
+                        }
+                        if (listed.isNotEmpty()) {
+                            appendLine("Доступные на сервере:")
+                            listed.take(50).forEach { appendLine("• $it") }
+                        } else {
+                            appendLine("Пресеты:")
+                            AgentSettings.PRESETS.forEach { appendLine("• ${it.label} — ${it.model}") }
+                        }
                     }
-                    pushItem(AgentItem.Info("$body\nСменить: кнопка ⚙ над чатом."))
+                    pushItem(AgentItem.Info("$text\nСменить: кнопка ⚙ над чатом. Каталог models.dev: /models dev."))
                     return
                 }
                 "agents" -> {
@@ -830,11 +893,25 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         // level, or the requested type for a `task` subagent.
         val agentDef = if (subagent != null) cfg.agent(subagent.subagentType)
         else _activeAgent.value?.let { cfg.agent(it) }
-        val effective = if (agentDef?.model != null) config.copy(model = agentDef.model) else config
+        // A model pinned by an agent (or written as provider/model) may select a
+        // configured provider's own endpoint and key.
+        val effectiveModel = agentDef?.model ?: config.model
+        val provider = cfg.providerFor(effectiveModel)
+        val effective = config.copy(
+            model = effectiveModel,
+            baseUrl = provider?.baseUrl ?: config.baseUrl,
+            apiKey = provider?.apiKey?.takeIf { it.isNotBlank() } ?: config.apiKey,
+            temperature = agentDef?.temperature ?: config.temperature,
+            topP = agentDef?.topP ?: config.topP,
+            maxOutputTokens = agentDef?.maxOutputTokens ?: config.maxOutputTokens,
+            reasoningEffort = agentDef?.reasoningEffort ?: config.reasoningEffort,
+        )
+        val disabled = cfg.disabledTools()
         val baseTools = agentDef?.tools ?: allowedTools
+        val enabledTools = (baseTools ?: OpenCodeTools.ALL_TOOLS).minus(disabled)
         // A subagent never gets `task` (no nesting) or `question` (no user).
-        val effectiveTools = if (subagent != null) baseTools?.minus(setOf("task", "question")) else baseTools
-        val tools = OpenCodeTools(workspace, activeNode, npxRuntime, projectDir, config.githubToken, busybox)
+        val effectiveTools = if (subagent != null) enabledTools.minus(setOf("task", "question")) else enabledTools
+        val tools = OpenCodeTools(workspace, activeNode, npxRuntime, projectDir, effective.githubToken, busybox)
         tools.allowedTools = effectiveTools
 
         // Permission gate built from opencode.json; the mode is only a fallback.
@@ -847,6 +924,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
         // Snapshot each file before the agent changes it, for /undo.
         tools.onBeforeWrite = { file -> recordTurnFile(run, file, projectDir) }
+        tools.formatters = cfg.formatters
         if (subagent == null) {
             // Only top-level agents spawn subagents; nesting stays impossible.
             tools.subagentRunner = { request -> runSubagent(info, request, config) }
@@ -1056,10 +1134,18 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             return
         }
         val names = mutableListOf<String>()
+        run.redoSnapshots.clear()
+        run.redoCreated.clear()
         run.turnSnapshots.asReversed().forEach { (file, version) ->
+            if (file.isFile) history.snapshot(file, projectDir)?.let { run.redoSnapshots += file to it }
             if (history.restore(version, file, projectDir)) names += workspace.relativeTo(file)
         }
-        run.turnCreated.reversed().forEach { f -> if (f.isFile && f.delete()) names += "-${workspace.relativeTo(f)}" }
+        run.turnCreated.reversed().forEach { f ->
+            if (f.isFile) {
+                runCatching { run.redoCreated += f to f.readText(Charsets.UTF_8) }
+                if (f.delete()) names += "-${workspace.relativeTo(f)}"
+            }
+        }
         run.turnSnapshots.clear()
         run.turnCreated.clear()
         run.turnFiles.clear()
@@ -1067,7 +1153,41 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         pushItem(
             AgentItem.Info(
                 if (names.isEmpty()) "Не удалось отменить изменения."
-                else "Отменено в последнем ходе:\n" + names.distinct().joinToString("\n") { "• $it" },
+                else "Отменено в последнем ходе:\n" + names.distinct().joinToString("\n") { "• $it" } + "\nВернуть: /redo",
+            ),
+        )
+    }
+
+    /** `/redo`: re-applies the changes the last `/undo` reverted. */
+    fun redoLastTurn() {
+        val run = activeRun.value ?: return
+        if (run.running.value) {
+            pushItem(AgentItem.Info("Агент ещё работает — сначала остановите ход (⏹)."))
+            return
+        }
+        val projectDir = run.projectDir ?: _selected.value?.dir
+        if (projectDir == null) return
+        if (run.redoSnapshots.isEmpty() && run.redoCreated.isEmpty()) {
+            pushItem(AgentItem.Info("Нечего возвращать: сначала отмените изменения через /undo."))
+            return
+        }
+        val names = mutableListOf<String>()
+        run.redoSnapshots.asReversed().forEach { (file, version) ->
+            if (file.isFile) history.snapshot(file, projectDir)?.let { run.turnSnapshots += file to it } else run.turnCreated += file
+            if (history.restore(version, file, projectDir)) names += workspace.relativeTo(file)
+        }
+        run.redoCreated.asReversed().forEach { (f, content) ->
+            if (f.isFile) history.snapshot(f, projectDir)?.let { run.turnSnapshots += f to it } else run.turnCreated += f
+            runCatching { f.parentFile?.mkdirs(); f.writeText(content, Charsets.UTF_8); names += workspace.relativeTo(f) }
+        }
+        run.redoSnapshots.clear()
+        run.redoCreated.clear()
+        run.turnFiles.clear()
+        agentTouchedFiles()
+        pushItem(
+            AgentItem.Info(
+                if (names.isEmpty()) "Не удалось вернуть изменения."
+                else "Возвращено:\n" + names.distinct().joinToString("\n") { "• $it" },
             ),
         )
     }

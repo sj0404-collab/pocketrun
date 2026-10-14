@@ -144,4 +144,89 @@ class OpenCodeConfigTest {
         assertEquals("a.kt", OpenCodeConfig.keyArgFor("edit", org.json.JSONObject().put("filePath", "a.kt")))
         assertEquals("https://x", OpenCodeConfig.keyArgFor("webfetch", org.json.JSONObject().put("url", "https://x")))
     }
+
+    @Test
+    fun globalToolsCanBeDisabled() {
+        val ws = newWorkspace()
+        val project = File(ws.root, "proj").apply { mkdirs() }
+        write(File(project, "opencode.json"), """{"tools":{"websearch":false,"bash":true,"write":"off"}}""")
+        val cfg = OpenCodeConfig.load(ws, project)
+        assertEquals(setOf("websearch", "write"), cfg.disabledTools())
+    }
+
+    @Test
+    fun projectToolsOverrideGlobal() {
+        val ws = newWorkspace()
+        write(File(ws.root, "opencode/opencode.json"), """{"tools":{"bash":false}}""")
+        val project = File(ws.root, "proj").apply { mkdirs() }
+        write(File(project, "opencode.json"), """{"tools":{"bash":true}}""")
+        assertTrue(OpenCodeConfig.load(ws, project).disabledTools().isEmpty())
+    }
+
+    @Test
+    fun providersAndProviderFor() {
+        val ws = newWorkspace()
+        val project = File(ws.root, "proj").apply { mkdirs() }
+        write(
+            File(project, "opencode.json"),
+            """{"provider":{"myserver":{"name":"My Server","options":{"baseURL":"https://api.example.com/v1","apiKey":"sk-x"},"models":{"llama-3":"Llama 3","mixtral":"Mixtral"}}}}""",
+        )
+        val cfg = OpenCodeConfig.load(ws, project)
+        val p = cfg.providers["myserver"]
+        assertNotNull(p)
+        assertEquals("https://api.example.com/v1", p!!.baseUrl)
+        assertEquals("sk-x", p.apiKey)
+        assertEquals(setOf("llama-3", "mixtral"), p.models.toSet())
+        assertEquals("myserver", cfg.providerFor("myserver/llama-3")?.id)
+        assertEquals("myserver", cfg.providerFor("llama-3")?.id)
+        assertNull(cfg.providerFor("openai/gpt-4o"))
+    }
+
+    @Test
+    fun formattersAreParsed() {
+        val ws = newWorkspace()
+        val project = File(ws.root, "proj").apply { mkdirs() }
+        write(
+            File(project, "opencode.json"),
+            """{"formatter":{"prettier":{"command":["npx","prettier","--write","${'$'}FILE"],"extensions":[".ts",".tsx"]}}}""",
+        )
+        val cfg = OpenCodeConfig.load(ws, project)
+        assertEquals(1, cfg.formatters.size)
+        val fmt = cfg.formatters.first()
+        assertEquals("prettier", fmt.name)
+        assertEquals(listOf("npx", "prettier", "--write", "\$FILE"), fmt.command)
+        assertEquals(listOf(".ts", ".tsx"), fmt.extensions)
+    }
+
+    @Test
+    fun agentModelKnobsFromJsonAndMarkdown() {
+        val ws = newWorkspace()
+        val project = File(ws.root, "proj").apply { mkdirs() }
+        write(
+            File(project, "opencode.json"),
+            """{"agent":{"fast":{"model":"m","options":{"temperature":0.7,"top_p":0.9,"max_tokens":1234,"reasoning_effort":"high"}}}}""",
+        )
+        write(File(project, ".opencode/agent/heel.md"), "---\nmodel: m\ntemperature: 0.1\ntopP: 0.5\nmaxTokens: 10\n---\nBody")
+        val cfg = OpenCodeConfig.load(ws, project)
+        val fast = cfg.agent("fast")!!
+        assertEquals(0.7, fast.temperature!!, 0.0001)
+        assertEquals(0.9, fast.topP!!, 0.0001)
+        assertEquals(1234, fast.maxOutputTokens)
+        assertEquals("high", fast.reasoningEffort)
+        val heel = cfg.agent("heel")!!
+        assertEquals(0.1, heel.temperature!!, 0.0001)
+        assertEquals(0.5, heel.topP!!, 0.0001)
+        assertEquals(10, heel.maxOutputTokens)
+    }
+
+    @Test
+    fun modelsDevCatalogIsParsed() {
+        val json = """{"openai":{"id":"openai","name":"OpenAI","models":{"gpt-4o":{"id":"gpt-4o","name":"GPT-4o","tool_call":true,"reasoning":false}}}}"""
+        val catalog = ModelsDev.parse(json)
+        val openai = catalog["openai"]
+        assertNotNull(openai)
+        assertEquals("OpenAI", openai!!.name)
+        assertEquals("GPT-4o", openai.models.single().name)
+        assertTrue(openai.models.single().toolCall)
+    }
 }

@@ -26,6 +26,12 @@ class OpenCodeConfig private constructor(
     private val permissions: Map<String, PermissionRule>,
     val agents: Map<String, AgentDef>,
     val commands: Map<String, CommandDef>,
+    /** Top-level `tools` switches (`false` disables a tool for every agent). */
+    val tools: Map<String, Boolean> = emptyMap(),
+    /** Named `provider` entries from opencode.json, keyed by provider id. */
+    val providers: Map<String, ProviderDef> = emptyMap(),
+    /** `formatter` commands run after the agent writes a file. */
+    val formatters: List<FormatterDef> = emptyList(),
 ) {
 
     enum class Permission { ALLOW, ASK, DENY }
@@ -37,6 +43,20 @@ class OpenCodeConfig private constructor(
         data class Patterned(val entries: List<Pair<String, Permission>>) : PermissionRule
     }
 
+    data class ProviderDef(
+        val id: String,
+        val name: String?,
+        val baseUrl: String?,
+        val apiKey: String?,
+        val models: List<String>,
+    )
+
+    data class FormatterDef(
+        val name: String,
+        val command: List<String>,
+        val extensions: List<String>,
+    )
+
     data class AgentDef(
         val name: String,
         val description: String,
@@ -46,6 +66,10 @@ class OpenCodeConfig private constructor(
         val tools: Set<String>?,
         val global: Boolean,
         val file: File?,
+        val temperature: Double? = null,
+        val topP: Double? = null,
+        val maxOutputTokens: Int? = null,
+        val reasoningEffort: String? = null,
     )
 
     data class CommandDef(
@@ -81,6 +105,20 @@ class OpenCodeConfig private constructor(
     /** Every agent name, sorted, for `/agents`. */
     fun agentNames(): List<String> = agents.keys.sorted()
 
+    /** Tools disabled globally (`"tools": { "write": false }`). */
+    fun disabledTools(): Set<String> = tools.filterValues { !it }.keys.map(::normalizeTool).toSet()
+
+    /**
+     * The provider a model belongs to: either an explicit `provider/model` id or
+     * a model listed under a provider. Null when nothing matches.
+     */
+    fun providerFor(model: String?): ProviderDef? {
+        if (model.isNullOrBlank()) return null
+        val prefix = model.substringBefore('/', "")
+        if (prefix.isNotEmpty()) providers[prefix]?.let { return it }
+        return providers.values.firstOrNull { p -> p.models.any { it == model || model.endsWith("/$it") } }
+    }
+
     companion object {
         /** Agent names that ship with the app (also valid `task` types). */
         val BUILTIN_AGENTS = listOf("build", "plan", "explore", "general")
@@ -89,8 +127,9 @@ class OpenCodeConfig private constructor(
             "edit" to "edit", "write" to "write", "patch" to "apply_patch",
             "apply_patch" to "apply_patch", "bash" to "bash", "read" to "read",
             "list" to "list", "glob" to "glob", "grep" to "grep",
-            "webfetch" to "webfetch", "skill" to "skill", "question" to "question",
-            "todowrite" to "todowrite", "github" to "github", "task" to "task",
+            "webfetch" to "webfetch", "websearch" to "websearch", "skill" to "skill",
+            "question" to "question", "todowrite" to "todowrite", "todoread" to "todoread",
+            "github" to "github", "task" to "task",
         )
 
         val EMPTY = OpenCodeConfig(null, emptyMap(), emptyMap(), emptyMap())
@@ -122,7 +161,19 @@ class OpenCodeConfig private constructor(
             mergeCommandJson(commands, globalJson, global = true)
             mergeCommandJson(commands, projectJson, global = false)
 
-            return OpenCodeConfig(model, permissions, agents, commands)
+            val tools = LinkedHashMap<String, Boolean>()
+            parseToolsSwitches(globalJson)?.let { tools.putAll(it) }
+            parseToolsSwitches(projectJson)?.let { tools.putAll(it) }
+
+            val providers = LinkedHashMap<String, ProviderDef>()
+            parseProviders(globalJson)?.let { providers.putAll(it) }
+            parseProviders(projectJson)?.let { providers.putAll(it) }
+
+            val formatters = LinkedHashMap<String, FormatterDef>()
+            parseFormatters(globalJson)?.let { formatters.putAll(it) }
+            parseFormatters(projectJson)?.let { formatters.putAll(it) }
+
+            return OpenCodeConfig(model, permissions, agents, commands, tools, providers, formatters.values.toList())
         }
 
         /** Bash/glob patterns: `*` and `?`, anchored at both ends. */
@@ -147,6 +198,7 @@ class OpenCodeConfig private constructor(
             "read", "write", "edit" -> args.optString("filePath")
             "list", "glob", "grep" -> args.optString("path")
             "webfetch" -> args.optString("url")
+            "websearch" -> args.optString("query")
             "skill" -> args.optString("name")
             "github" -> args.optString("op")
             "task" -> args.optString("subagent_type")
@@ -191,6 +243,68 @@ class OpenCodeConfig private constructor(
             else -> null
         }
 
+        /** Top-level `tools`: `{ "write": false, "bash": true }` → map. */
+        private fun parseToolsSwitches(file: File?): Map<String, Boolean>? {
+            val json = readJson(file) ?: return null
+            val obj = json.optJSONObject("tools") ?: return null
+            val out = LinkedHashMap<String, Boolean>()
+            val keys = obj.keys()
+            while (keys.hasNext()) {
+                val k = keys.next()
+                when (val v = obj.opt(k)) {
+                    is Boolean -> out[k] = v
+                    is String -> out[k] = v.trim().lowercase() !in setOf("false", "off", "deny", "disabled")
+                }
+            }
+            return out.ifEmpty { null }
+        }
+
+        /** `provider` entries: base URL, api key and the declared model list. */
+        private fun parseProviders(file: File?): Map<String, ProviderDef>? {
+            val json = readJson(file) ?: return null
+            val obj = json.optJSONObject("provider") ?: return null
+            val out = LinkedHashMap<String, ProviderDef>()
+            val keys = obj.keys()
+            while (keys.hasNext()) {
+                val id = keys.next()
+                val p = obj.optJSONObject(id) ?: continue
+                val options = p.optJSONObject("options") ?: p
+                val models = mutableListOf<String>()
+                p.optJSONObject("models")?.let { m -> m.keys().forEach { models += it } }
+                out[id] = ProviderDef(
+                    id = id,
+                    name = p.optString("name").takeIf { it.isNotBlank() },
+                    baseUrl = (options.optString("baseURL").takeIf { it.isNotBlank() }
+                        ?: options.optString("baseUrl").takeIf { it.isNotBlank() }),
+                    apiKey = (options.optString("apiKey").takeIf { it.isNotBlank() }
+                        ?: options.optString("api_key").takeIf { it.isNotBlank() }),
+                    models = models,
+                )
+            }
+            return out.ifEmpty { null }
+        }
+
+        /** `formatter`: `{ "prettier": { "command": ["prettier","--write","$FILE"], "extensions": [".ts"] } }`. */
+        private fun parseFormatters(file: File?): Map<String, FormatterDef>? {
+            val json = readJson(file) ?: return null
+            val obj = json.optJSONObject("formatter") ?: return null
+            val out = LinkedHashMap<String, FormatterDef>()
+            val keys = obj.keys()
+            while (keys.hasNext()) {
+                val name = keys.next()
+                val f = obj.optJSONObject(name) ?: continue
+                val command = f.optJSONArray("command")?.let { arr ->
+                    (0 until arr.length()).mapNotNull { arr.optString(it).takeIf { s -> s.isNotBlank() } }
+                }.orEmpty()
+                if (command.isEmpty()) continue
+                val extensions = f.optJSONArray("extensions")?.let { arr ->
+                    (0 until arr.length()).mapNotNull { arr.optString(it).takeIf { s -> s.isNotBlank() } }
+                }.orEmpty()
+                out[name] = FormatterDef(name, command, extensions)
+            }
+            return out.ifEmpty { null }
+        }
+
         private fun mergeAgentJson(into: MutableMap<String, AgentDef>, file: File?, global: Boolean) {
             val json = readJson(file) ?: return
             val obj = json.optJSONObject("agent") ?: return
@@ -199,6 +313,7 @@ class OpenCodeConfig private constructor(
                 val name = keys.next()
                 if (!Skills.nameMatches(name)) continue
                 val a = obj.optJSONObject(name) ?: continue
+                val options = a.optJSONObject("options") ?: a
                 into[name] = AgentDef(
                     name = name,
                     description = a.optString("description"),
@@ -208,6 +323,11 @@ class OpenCodeConfig private constructor(
                     tools = parseTools(a.opt("tools")),
                     global = global,
                     file = file,
+                    temperature = optDouble(options, "temperature"),
+                    topP = optDouble(options, "top_p") ?: optDouble(options, "topP"),
+                    maxOutputTokens = optInt(options, "max_tokens") ?: optInt(options, "maxTokens"),
+                    reasoningEffort = options.optString("reasoning_effort").takeIf { it.isNotBlank() }
+                        ?: options.optString("reasoningEffort").takeIf { it.isNotBlank() },
                 )
             }
         }
@@ -265,6 +385,10 @@ class OpenCodeConfig private constructor(
                     tools = front["tools"]?.let { parseTools(it) },
                     global = global,
                     file = file,
+                    temperature = front["temperature"]?.trim()?.toDoubleOrNull(),
+                    topP = (front["top_p"] ?: front["topP"])?.trim()?.toDoubleOrNull(),
+                    maxOutputTokens = (front["max_tokens"] ?: front["maxTokens"])?.trim()?.toIntOrNull(),
+                    reasoningEffort = (front["reasoning_effort"] ?: front["reasoningEffort"])?.trim()?.takeIf { it.isNotEmpty() },
                 )
                 name to a
             }
@@ -309,5 +433,11 @@ class OpenCodeConfig private constructor(
             val json = readJson(file) ?: return null
             return json.optString(key).trim().takeIf { it.isNotEmpty() }
         }
+
+        private fun optDouble(json: JSONObject, key: String): Double? =
+            if (json.has(key)) json.optDouble(key).takeIf { !it.isNaN() } else null
+
+        private fun optInt(json: JSONObject, key: String): Int? =
+            if (json.has(key)) json.optInt(key).takeIf { it > 0 } else null
     }
 }

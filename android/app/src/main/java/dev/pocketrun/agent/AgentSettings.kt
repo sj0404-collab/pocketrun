@@ -56,6 +56,15 @@ object AgentSettings {
         val githubToken: String = "",
         val confirmMode: String = MODE_AUTO,
         val maxSteps: Int = DEFAULT_MAX_STEPS,
+        /**
+         * Per-agent model options (from opencode.json). They are not persisted
+         * in the UI prefs: the effective config is rebuilt each turn from the
+         * config file, so these stay transient overrides.
+         */
+        val temperature: Double? = null,
+        val topP: Double? = null,
+        val maxOutputTokens: Int? = null,
+        val reasoningEffort: String? = null,
     ) {
         /**
          * The API key is optional: local servers (llama.cpp, vLLM) need none,

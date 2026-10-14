@@ -265,7 +265,10 @@ class LlmClient(private val config: AgentSettings.Config) {
         val body = JSONObject().apply {
             put("model", config.model)
             put("messages", messages)
-            put("temperature", 0.2)
+            put("temperature", config.temperature ?: 0.2)
+            config.topP?.let { put("top_p", it) }
+            config.maxOutputTokens?.let { put("max_tokens", it) }
+            config.reasoningEffort?.takeIf { it.isNotBlank() }?.let { put("reasoning_effort", it) }
             if (tools != null && tools.length() > 0) {
                 put("tools", tools)
                 put("tool_choice", "auto")

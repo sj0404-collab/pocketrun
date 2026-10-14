@@ -262,4 +262,29 @@ class OpenCodeToolsGateTest {
         assertTrue(seen.contains("a.txt"))
         assertTrue(seen.contains("b.txt"))
     }
+
+    @Test
+    fun formatterRunsAfterWrite() {
+        val h = newTools()
+        h.tools.formatters = listOf(OpenCodeConfig.FormatterDef("marker", listOf("touch", "marker.txt"), emptyList()))
+        val r = h.tools.execute("write", """{"filePath":"a.txt","content":"hi"}""")
+        assertTrue(r.contains("wrote"))
+        assertTrue(File(h.projectDir, "marker.txt").exists())
+    }
+
+    @Test
+    fun failingFormatterIsReported() {
+        val h = newTools()
+        h.tools.formatters = listOf(OpenCodeConfig.FormatterDef("bad", listOf("false"), emptyList()))
+        val r = h.tools.execute("write", """{"filePath":"a.txt","content":"hi"}""")
+        assertTrue(r.contains("форматтер bad"))
+    }
+
+    @Test
+    fun formatterRespectsExtensionFilter() {
+        val h = newTools()
+        h.tools.formatters = listOf(OpenCodeConfig.FormatterDef("md", listOf("false"), listOf(".md")))
+        val r = h.tools.execute("write", """{"filePath":"a.txt","content":"hi"}""")
+        assertFalse(r.contains("форматтер"))
+    }
 }
