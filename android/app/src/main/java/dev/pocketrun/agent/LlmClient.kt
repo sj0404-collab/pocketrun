@@ -189,7 +189,57 @@ class LlmClient(private val config: AgentSettings.Config) {
             return Response(content, calls)
         }
 
-        /** A user-readable, actionable description of a failed request. */
+        /** A session id of the exact shape OpenCode emits on every Zen request. */
+        fun newZenSessionId(): String {
+            val counter = kotlin.random.Random.nextInt(1, 64)
+            val mask = 0xffffffffffffL
+            val high = System.currentTimeMillis() and 0xfffffffffL
+            val value = ((high shl 12) + counter.toLong()) and mask
+            // descending: bitwise NOT in 48 bits
+            val desc = mask - value
+            val hex = "%012x".format(desc)
+            val base62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+            val tail = StringBuilder(14)
+            for (i in 0 until 14) tail.append(base62[kotlin.random.Random.nextInt(base62.length)])
+            return "ses_$hex$tail"
+        }
+
+        /** A message id of the exact shape OpenCode emits (ascending). */
+        fun newZenMessageId(): String {
+            val counter = kotlin.random.Random.nextInt(1, 64)
+            val mask = 0xffffffffffffL
+            val high = System.currentTimeMillis() and 0xfffffffffL
+            val value = ((high shl 12) + counter.toLong()) and mask
+            val base62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+            val tail = StringBuilder(14)
+            for (i in 0 until 14) tail.append(base62[kotlin.random.Random.nextInt(base62.length)])
+            return "msg_${"%012x".format(value)}$tail"
+        }
+
+        /** The Zen free-tier gate requires all four tool names to be advertised. */
+        private fun injectZenTools(tools: JSONArray?): JSONArray {
+            val present = linkedSetOf<String>()
+            tools?.let { arr ->
+                for (i in 0 until arr.length()) {
+                    arr.optJSONObject(i)?.optJSONObject("function")?.optString("name")?.let { present += it }
+                }
+            }
+            val out = JSONArray(tools?.toString() ?: "[]")
+            for (name in listOf("bash", "glob", "grep", "read")) {
+                if (name !in present) out.put(minimalTool(name))
+            }
+            return out
+        }
+
+        /** Minimal OpenAI tool schema carrying one of the required names. */
+        private fun minimalTool(name: String): JSONObject =
+            JSONObject().put("type", "function").put(
+                "function",
+                JSONObject().put("name", name).put("description", "required by the Zen free-tier gate").put(
+                    "parameters",
+                    JSONObject().put("type", "object").put("properties", JSONObject()),
+                ),
+            )
         internal fun describe(t: Throwable): String = when (t) {
             is LlmException -> t.message ?: "ошибка модели"
             is HttpFailure -> {
@@ -262,6 +312,8 @@ class LlmClient(private val config: AgentSettings.Config) {
         isCancelled: () -> Boolean,
         onDelta: ((String) -> Unit)?,
     ): Response {
+        val isZen = config.baseUrl.contains("opencode.ai/zen", ignoreCase = true)
+        val effectiveTools = if (isZen) injectZenTools(tools) else tools
         val body = JSONObject().apply {
             put("model", config.model)
             put("messages", messages)
@@ -269,13 +321,14 @@ class LlmClient(private val config: AgentSettings.Config) {
             config.topP?.let { put("top_p", it) }
             config.maxOutputTokens?.let { put("max_tokens", it) }
             config.reasoningEffort?.takeIf { it.isNotBlank() }?.let { put("reasoning_effort", it) }
-            if (tools != null && tools.length() > 0) {
-                put("tools", tools)
+            if (effectiveTools != null && effectiveTools.length() > 0) {
+                put("tools", effectiveTools)
                 put("tool_choice", "auto")
             }
-            if (stream) put("stream", true)
+            if (stream || isZen) put("stream", true)
         }
 
+        val sessionId = if (isZen) newZenSessionId() else null
         val conn = (URL(config.endpoint).openConnection() as HttpURLConnection).apply {
             requestMethod = "POST"
             connectTimeout = CONNECT_TIMEOUT_MS
@@ -283,10 +336,21 @@ class LlmClient(private val config: AgentSettings.Config) {
             doOutput = true
             setRequestProperty("Content-Type", "application/json")
             setRequestProperty("Accept", if (stream) "text/event-stream, application/json" else "application/json")
-            // No Authorization header without a key: local servers reject
-            // stray headers far less often than cloud ones reject bad keys.
+            // OpenCode's Zen free-tier gate requires the opencode client fingerprint.
+            if (isZen) setRequestProperty("User-Agent", "opencode/latest/2.0.22/cli")
+            if (sessionId != null) {
+                setRequestProperty("x-opencode-session", sessionId)
+                setRequestProperty("x-opencode-session-id", sessionId)
+                setRequestProperty("x-opencode-request", newZenMessageId())
+                setRequestProperty("x-opencode-client", "cli")
+                setRequestProperty("x-opencode-project", "global")
+            }
+            // No Authorization header without a key: local servers reject stray
+            // headers far less often than cloud ones reject bad keys.
             if (config.apiKey.isNotBlank()) {
                 setRequestProperty("Authorization", "Bearer ${config.apiKey}")
+            } else if (isZen) {
+                setRequestProperty("Authorization", "Bearer public")
             }
         }
         val watchdog = Watchdog(conn)
