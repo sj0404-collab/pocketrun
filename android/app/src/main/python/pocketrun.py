@@ -1,0 +1,257 @@
+"""Entry points that the Android side calls through Chaquopy.
+
+Kotlin owns the UI, the sandbox and process lifetime; everything that only makes
+sense in Python lives here: argv handling, sys.path setup, stream redirection and
+traceback formatting.
+
+User code runs inside the interpreter with the app's own uid, so `open` and `os`
+would reach the activation key in shared_prefs and every other project. The
+`pocketrun_sandbox` audit-hook jail is what keeps a script inside the workspace.
+"""
+
+import io
+import json
+import os
+import runpy
+import sys
+import traceback
+
+import pocketrun_sandbox
+
+# Nothing here is reachable from a script: the loopback interface (the app's own
+# java bridges and any local debug server), link-local addresses (cloud metadata)
+# and unix sockets (any local service).
+BLOCKED_HOSTS = ("localhost", "127.0.0.1", "::1", "0.0.0.0", "169.254.169.254")
+
+
+class PipeStream:
+    """A minimal text stream that appends to a file the Android side tails.
+
+    Using a file rather than a pipe means slow readers can never stall the
+    interpreter, and output survives a crash of the UI process.
+    """
+
+    def __init__(self, path, mirror=None):
+        self._file = open(path, "a", encoding="utf-8", buffering=1, errors="replace")
+        self._mirror = mirror
+
+    encoding = "utf-8"
+    errors = "replace"
+
+    def write(self, text):
+        if not isinstance(text, str):
+            text = str(text)
+        self._file.write(text)
+        if self._mirror is not None:
+            self._mirror.write(text)
+        return len(text)
+
+    def writelines(self, lines):
+        for line in lines:
+            self.write(line)
+
+    def flush(self):
+        self._file.flush()
+
+    def isatty(self):
+        return False
+
+    def writable(self):
+        return True
+
+    def readable(self):
+        return False
+
+    def seekable(self):
+        return False
+
+    def close(self):
+        try:
+            self._file.close()
+        except Exception:
+            pass
+
+
+def run(script, args_json, stdin_text, out_path, err_path, cwd, sandbox_root=None):
+    """Runs ``script`` as __main__ and returns its exit code.
+
+    ``sandbox_root`` is the workspace directory; the script may read the Python
+    installation (stdlib, installed packages) but may only touch the workspace.
+    """
+    if not os.path.isfile(script):
+        _write_line(err_path, "python: no such file: %s" % script)
+        return 2
+
+    try:
+        args = json.loads(args_json) if args_json else []
+    except ValueError as exc:
+        _write_line(err_path, "python: invalid args json: %s" % exc)
+        return 2
+    if not isinstance(args, list):
+        _write_line(err_path, "python: args json must be a list")
+        return 2
+    args = [str(arg) for arg in args]
+
+    # The interpreter is process-wide, so every bit of global state we touch has
+    # to go back to exactly what it was, or the next run inherits it.
+    previous = (
+        sys.stdout,
+        sys.stderr,
+        sys.stdin,
+        sys.argv,
+        os.getcwd(),
+        list(sys.path),
+    )
+    if cwd:
+        try:
+            os.chdir(cwd)
+        except OSError as exc:
+            _write_line(err_path, "python: cannot enter %s: %s" % (cwd, exc))
+            return 2
+
+    sys.argv = [script] + args
+    script_dir = os.path.dirname(os.path.abspath(script))
+    if script_dir not in sys.path:
+        sys.path.insert(0, script_dir)
+
+    if stdin_text is not None:
+        sys.stdin = io.StringIO(stdin_text)
+
+    out = PipeStream(out_path, previous[0])
+    err = PipeStream(err_path, previous[1])
+    sys.stdout, sys.stderr = out, err
+    code = 0
+    failure = None
+    try:
+        with pocketrun_sandbox.intercept(
+            read_roots=_read_roots(sandbox_root or cwd),
+            write_roots=[sandbox_root or cwd],
+            blocked_hosts=BLOCKED_HOSTS,
+        ):
+            try:
+                runpy.run_path(script, run_name="__main__")
+            except SystemExit as exc:
+                code = _exit_code(exc.code)
+            except KeyboardInterrupt:
+                _write_line(err_path, "KeyboardInterrupt")
+                code = 130
+            except BaseException:
+                # SandboxViolation lands here too: the traceback is the report,
+                # and it is written once the jail is off.
+                failure = sys.exc_info()
+                code = 1
+        if failure is not None:
+            _report(failure, err)
+    finally:
+        # Restoring global state happens outside the jail: the previous working
+        # directory is the app's own, and the jail would refuse to go back to it.
+        sys.stdout, sys.stderr, sys.stdin, sys.argv = previous[:4]
+        # sys.path too: a script folder left behind outlives its workspace, and
+        # the next run would walk a path that is not there anymore.
+        sys.path[:] = previous[5]
+        out.close()
+        err.close()
+        try:
+            os.chdir(previous[4])
+        except OSError:
+            pass
+    return code
+
+
+def _report(failure, err):
+    """Writes the traceback of [failure] to [err] without ever raising.
+
+    Formatting a traceback reads source files and lazily imports the standard
+    library, which is why it runs with the jail off: reporting a violation must
+    not be the thing that trips the jail a second time.
+    """
+    try:
+        traceback.print_exception(failure[0], failure[1], failure[2], file=err)
+    except Exception as exc:  # a broken report is still not a broken run
+        err.write("%s: %s\n" % (failure[0].__name__, exc))
+
+
+def _read_roots(sandbox_root):
+    """Where a script may read: the workspace plus the Python installation.
+
+    Chaquopy unpacks the interpreter, the standard library and every pip
+    package into the app's data directory, so the workspace alone is not enough
+    to run anything.
+    """
+    roots = [sandbox_root]
+    roots.extend(pocketrun_sandbox.interpreter_roots())
+    return roots
+
+
+def check_script(script):
+    """Cheap syntax check so the editor can flag errors before a run."""
+    if not os.path.isfile(script):
+        return "no such file: %s" % script
+    with open(script, "r", encoding="utf-8", errors="replace") as handle:
+        source = handle.read()
+    try:
+        compile(source, os.path.basename(script), "exec")
+        return None
+    except SyntaxError as exc:
+        return "line %s: %s" % (exc.lineno, exc.msg)
+    except ValueError as exc:
+        return str(exc)
+
+
+def list_packages():
+    """Installed distributions, for the packages screen."""
+    try:
+        from importlib import metadata
+    except ImportError:
+        return []
+    found = []
+    for dist in metadata.distributions():
+        try:
+            name = dist.metadata["Name"]
+            if not name:
+                continue
+            found.append({"name": name, "version": dist.version or "?"})
+        except Exception:
+            continue
+    found.sort(key=lambda item: item["name"].lower())
+    return found
+
+
+def interpreter_info():
+    return {
+        "version": sys.version.split()[0],
+        "implementation": sys.implementation.name,
+        "executable": sys.executable,
+        "path": sys.path[:],
+    }
+
+
+def _exit_code(value):
+    if value is None:
+        return 0
+    if isinstance(value, bool):
+        return 1 if value else 0
+    if isinstance(value, int):
+        return value
+    _write_line_to_stderr("SystemExit: %s" % (value,))
+    return 1
+
+
+def _write_line(path, text):
+    _write_line_to_stderr(text, path)
+
+
+def _write_line_to_stderr(text, path=None):
+    if path:
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(text + "\n")
+    else:
+        # sys.__stderr__ is None on builds where stderr is not connected.
+        stream = sys.__stderr__
+        if stream is None:
+            return
+        try:
+            stream.write(text + "\n")
+            stream.flush()
+        except Exception:
+            pass

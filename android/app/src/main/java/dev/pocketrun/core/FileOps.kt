@@ -1,0 +1,104 @@
+package dev.pocketrun.core
+
+import java.io.File
+import java.io.IOException
+
+/**
+ * Creating, renaming, moving and deleting inside a project. The file manager in
+ * the app and the agent's own tools must not disagree about what a legal name is,
+ * so both go through here.
+ */
+object FileOps {
+    private const val MAX_NAME = 120
+
+    /**
+     * A name that is safe to put in a directory: no separators, no parent
+     * references, no control characters, nothing empty. Returns null when the name
+     * cannot be used at all, so the caller can say so instead of silently
+     * inventing a different name.
+     */
+    fun safeName(raw: String): String? {
+        val name = raw.trim().trim('/')
+        if (name.isEmpty() || name.length > MAX_NAME) return null
+        if (name == "." || name == "..") return null
+        if (name.any { it == '/' || it == '\\' || it.code < 32 }) return null
+        if (name.contains(':')) return null
+        return name
+    }
+
+    /** "main.py" is taken, so the new file is "main (2).py". */
+    fun uniqueName(dir: File, name: String): File {
+        var candidate = File(dir, name)
+        if (!candidate.exists()) return candidate
+        val base = name.substringBeforeLast('.', name)
+        val ext = name.substringAfterLast('.', "")
+        var n = 2
+        while (candidate.exists() && n < 10_000) {
+            val next = if (ext.isEmpty()) "$base ($n)" else "$base ($n).$ext"
+            candidate = File(dir, next)
+            n++
+        }
+        return candidate
+    }
+
+    fun createFile(dir: File, rawName: String, template: String = ""): File? {
+        val name = safeName(rawName) ?: return null
+        if (!dir.isDirectory) return null
+        val file = uniqueName(dir, name)
+        return try {
+            file.parentFile?.mkdirs()
+            file.writeText(template, Charsets.UTF_8)
+            file
+        } catch (_: IOException) {
+            null
+        }
+    }
+
+    fun createDir(dir: File, rawName: String): File? {
+        val name = safeName(rawName) ?: return null
+        val target = uniqueName(dir, name)
+        return if (target.mkdirs()) target else null
+    }
+
+    /** Renames in place. The target name is made unique first, so a rename never
+     *  silently overwrites a file the user cares about. */
+    fun rename(file: File, rawName: String): File? {
+        val name = safeName(rawName) ?: return null
+        val parent = file.parentFile ?: return null
+        if (File(parent, name) == file) return file
+        val target = uniqueName(parent, name)
+        return try {
+            if (file.renameTo(target)) target else null
+        } catch (_: SecurityException) {
+            null
+        }
+    }
+
+    /** Moves a file or a whole folder into another folder of the same project. */
+    fun move(file: File, targetDir: File): File? {
+        val parent = file.parentFile ?: return null
+        if (targetDir == parent) return file
+        if (file.isDirectory && targetDir.absolutePath.startsWith(file.absolutePath + File.separator)) {
+            return null // a folder cannot be moved into itself
+        }
+        if (!targetDir.isDirectory) return null
+        val target = uniqueName(targetDir, file.name)
+        return try {
+            if (file.renameTo(target)) target else null
+        } catch (_: SecurityException) {
+            null
+        }
+    }
+
+    fun delete(file: File): Boolean = try {
+        if (file.isDirectory) file.deleteRecursively() else file.delete()
+    } catch (_: SecurityException) {
+        false
+    }
+
+    /** A name for a folder that is safe on FAT-style volumes too. */
+    fun slug(name: String): String {
+        val cleaned = name.trim().replace(Regex("[^\\p{L}\\p{N}._-]+"), "_").trim('.', '_')
+        return cleaned.take(MAX_NAME).ifEmpty { "project" }
+    }
+}
