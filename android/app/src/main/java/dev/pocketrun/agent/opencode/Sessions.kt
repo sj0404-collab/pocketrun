@@ -35,6 +35,74 @@ class Sessions(private val workspace: Workspace) {
         var todos: List<Todo>,
     )
 
+    data class Hit(val info: SessionInfo, val count: Int)
+
+    /** Every saved session whose title or history mentions [query]. */
+    fun search(query: String, limit: Int = 30): List<Hit> {
+        val q = query.trim().lowercase()
+        if (q.isEmpty()) return emptyList()
+        val out = ArrayList<Hit>()
+        for (info in list()) {
+            val s = load(info.id) ?: continue
+            val hits = countMatches(s.messages, q) + if (info.title.lowercase().contains(q)) 1 else 0
+            if (hits > 0) out += Hit(info, hits)
+            if (out.size >= limit) break
+        }
+        return out
+    }
+
+    /** Case-insensitive occurrences of [q] across a session's history. */
+    fun countMatches(messages: JSONArray, query: String): Int {
+        val q = query.trim().lowercase()
+        if (q.isEmpty()) return 0
+        var count = 0
+        for (i in 0 until messages.length()) {
+            val text = messages.optString(i).lowercase()
+            var from = 0
+            while (true) {
+                val at = text.indexOf(q, from)
+                if (at < 0) break
+                count++
+                from = at + q.length
+            }
+        }
+        return count
+    }
+
+    /** The body of the `messages` field, matched as text. */
+    fun snippet(messages: JSONArray, query: String, radius: Int = 120): String {
+        val q = query.trim().lowercase()
+        val text = buildString { for (i in 0 until messages.length()) appendLine(messages.optString(i)) }
+        val at = text.lowercase().indexOf(q)
+        if (at < 0) return ""
+        val from = (at - radius).coerceAtLeast(0)
+        val to = (at + q.length + radius).coerceAtMost(text.length)
+        return "…" + text.substring(from, to).replace('\n', ' ').trim() + "…"
+    }
+
+    /** Brings a session back from a JSON file (the export format) under a new id. */
+    fun import(file: File): Session? {
+        if (!file.isFile) return null
+        return try {
+            val json = JSONObject(file.readText(Charsets.UTF_8))
+            val source = json.optJSONArray("messages") ?: json.optJSONObject("data")?.optJSONArray("messages")
+            val messages = source ?: JSONArray()
+            val title = json.optString("title").takeIf { it.isNotBlank() } ?: file.nameWithoutExtension
+            val project = json.optString("project").takeIf { it.isNotBlank() && it != "null" }
+            val session = create(
+                project = project,
+                title = "импорт: $title",
+                model = json.optString("model").takeIf { it.isNotBlank() && it != "null" },
+            )
+            session.messages = JSONArray(messages.toString())
+            session.todos = parseTodos(json.optJSONArray("todos"))
+            save(session)
+            session
+        } catch (t: Throwable) {
+            null
+        }
+    }
+
     private val dir: File get() = File(workspace.root, "opencode-data/sessions").apply { mkdirs() }
 
     fun create(project: String?, title: String? = null, parentID: String? = null, model: String? = null): Session {

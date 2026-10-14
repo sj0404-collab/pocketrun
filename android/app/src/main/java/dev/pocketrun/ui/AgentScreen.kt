@@ -157,6 +157,17 @@ fun AgentScreen(viewModel: AppViewModel) {
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     maxLines = 1,
                 )
+                val ctxTokens = viewModel.agentContextTokens.collectAsState().value
+                if (ctxTokens > 0) {
+                    val percent = (ctxTokens * 100 / AppViewModel.CONTEXT_WINDOW_TOKENS).coerceIn(0, 100)
+                    Text(
+                        text = "контекст ~${"%,d".format(ctxTokens / 1000)}k / ${AppViewModel.CONTEXT_WINDOW_TOKENS / 1000}k ($percent%)",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = if (percent >= 75) MaterialTheme.colorScheme.error
+                        else MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                    )
+                }
             }
             IconButton(
                 onClick = { viewModel.refreshSessions(); showSessions = true },
@@ -406,6 +417,8 @@ fun AgentScreen(viewModel: AppViewModel) {
                     "/undo" to "отменить изменения хода",
                     "/redo" to "вернуть отменённое",
                     "/share" to "поделиться сессией",
+                    "/find" to "поиск по сессиям",
+                    "/import" to "импорт сессии из JSON",
                     "/editor" to "открыть редактор",
                 ).forEach { add(it) }
                 cfg.commandNames().forEach { add("/$it" to "своя команда") }
@@ -551,11 +564,15 @@ private fun ApprovalCard(pa: AppViewModel.PendingApproval) {
                 modifier = Modifier.fillMaxWidth(),
             ) {
                 OutlinedButton(
-                    onClick = { pa.respond(false) },
+                    onClick = { pa.respond(false, false) },
                     modifier = Modifier.weight(1f),
                 ) { Text("Отклонить", color = MaterialTheme.colorScheme.error) }
+                OutlinedButton(
+                    onClick = { pa.respond(true, true) },
+                    modifier = Modifier.weight(1f),
+                ) { Text("Всегда разрешить") }
                 Button(
-                    onClick = { pa.respond(true) },
+                    onClick = { pa.respond(true, false) },
                     modifier = Modifier.weight(1f),
                 ) { Text("Разрешить") }
             }

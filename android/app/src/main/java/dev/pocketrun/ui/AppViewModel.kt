@@ -240,7 +240,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     )
 
     /** A mutating tool call the agent is blocked on in manual confirm mode. */
-    data class PendingApproval(val tool: String, val argsPreview: String, val respond: (Boolean) -> Unit)
+    data class PendingApproval(
+        val tool: String,
+        val argsPreview: String,
+        /** (approve this call, remember the choice for future calls of the same pattern). */
+        val respond: (Boolean, Boolean) -> Unit,
+    )
 
     /**
      * Everything one session needs while its turn runs. Kept apart from the
@@ -269,28 +274,42 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         var deleted: Boolean = false
 
         /**
-         * Undo support for `/undo`: the pre-turn version of every existing file
-         * the agent changes, and the path of every file it creates, captured as
-         * it goes. Cleared at the start of each turn.
+         * `/undo` history: each entry is one reversible step (the conversation
+         * plus every file a turn changed). Newest is last. `/redo` restores the
+         * steps the last undos reverted.
          */
-        val turnSnapshots = mutableListOf<Pair<File, Version>>()
-        val turnCreated = mutableListOf<File>()
-        val turnFiles = mutableSetOf<String>()
+        val undoStack = ArrayDeque<Change>()
+        val redoStack = ArrayDeque<Change>()
 
-        /**
-         * Redo support for `/redo`: the post-turn version of every file the last
-         * undo reverted, and the contents of every created file it deleted.
-         */
-        val redoSnapshots = mutableListOf<Pair<File, Version>>()
-        val redoCreated = mutableListOf<Pair<File, String>>()
+        /** The step being recorded by the in-flight turn, if any. */
+        @Volatile
+        var pendingChange: Change? = null
+
+        /** Rough token estimate of [history] (plus tools/prompt overhead). */
+        val context = MutableStateFlow(0)
+
+        /** When a subagent writes files, they belong to the parent's step. */
+        @Volatile
+        var undoTarget: SessionRun? = null
 
         /** Unblocks whoever is waiting on a question/approval when the turn stops. */
         fun release() {
             pendingQuestion.value?.answer?.invoke("(отменено пользователем)")
-            pendingApproval.value?.respond?.invoke(false)
+            pendingApproval.value?.respond?.invoke(false, false)
             pendingQuestion.value = null
             pendingApproval.value = null
         }
+    }
+
+    /** One saved file state: [version] is null when the file must be absent. */
+    class FileState(val file: File, val version: Version?)
+
+    /** A reversible step: the conversation and file states to restore. */
+    class Change {
+        var history: JSONArray = JSONArray()
+        var messages: List<AgentItem> = emptyList()
+        val files = mutableListOf<FileState>()
+        val keys = mutableSetOf<String>()
     }
 
     private val _llmConfig = MutableStateFlow(AgentSettings.read(app))
@@ -339,6 +358,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     val agentSteps: StateFlow<Int> = activeFlow(0) { it.steps }
     val agentRounds: StateFlow<Int> = activeFlow(0) { it.rounds }
     val turnStartedAt: StateFlow<Long> = activeFlow(0L) { it.startedAt }
+    val agentContextTokens: StateFlow<Int> = activeFlow(0) { it.context }
 
     /** Ids of every session with a turn in flight, so a tab can show it. */
     @OptIn(ExperimentalCoroutinesApi::class)
@@ -565,8 +585,11 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         val prompt = text.trim()
         if (prompt.isEmpty()) return
 
+        // `@path` in a prompt pulls that file's contents in as context.
+        val (sendText, showText) = expandMentions(prompt)
+
         // Chat commands, opencode-style. They always act on the active tab.
-        when (prompt) {
+        when (showText) {
             "/new" -> {
                 newSession()
                 pushItem(AgentItem.Info("Новая сессия${projectName()?.let { " для проекта $it" } ?: ""}."))
@@ -575,20 +598,19 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             "/init" -> {
                 val info = ensureSession()
                 if (!requireConfigured()) return
-                runFor(info).messages.update { it + AgentItem.User("/init") }
                 runAgentTurn(
                     "Create an AGENTS.md file in the current project root: briefly describe the project " +
                         "(look at the files first) and add short, useful rules for future agents working in it. " +
                         "Keep it under 30 lines. Reply with a one-line summary.",
                     info,
+                    display = "/init",
                 )
                 return
             }
             "/continue" -> {
                 val info = ensureSession()
                 if (!requireConfigured()) return
-                runFor(info).messages.update { it + AgentItem.User("/continue") }
-                runAgentTurn(OpenCodeAgent.CONTINUE_PROMPT, info)
+                runAgentTurn(OpenCodeAgent.CONTINUE_PROMPT, info, display = "/continue")
                 return
             }
             "/skills" -> {
@@ -609,14 +631,15 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     AgentItem.Info(
                         "Команды: /new — новая сессия · /init — создать AGENTS.md · /continue — продолжить прерванный ход · /skills — список навыков · " +
                             "/agent <имя> — выбрать агента · /agents — список агентов · /models — модели · /sessions — сессии · /editor — открыть редактор · " +
-                            "/compact — сжать историю · /undo — отменить изменения последнего хода · /redo — вернуть отменённое · /share — поделиться сессией · /help — эта справка" +
+                            "/compact — сжать историю · /undo — отменить изменения последнего хода · /redo — вернуть отменённое · /share — поделиться сессией · /find — поиск по сессиям · /import — импорт сессии · /help — эта справка" +
                             (if (custom.isNotEmpty()) " · свои команды: " + custom.joinToString(", ") { "/$it" } else "") + ".\n\n" +
                             "Свои команды: opencode.json → command, или файл .opencode/command/<имя>.md (frontmatter description/agent/model + шаблон с \$ARGUMENTS, \$1…\$9 и @файл).\n" +
                             "Агенты: opencode.json → agent, или .opencode/agent/<имя>.md (frontmatter description/model/tools/mode + промпт в теле).\n" +
                             "Права: opencode.json → permission (allow/ask/deny, для bash — с шаблонами вроде \"rm *\": \"deny\").\n\n" +
                             "Отключить инструменты глобально: opencode.json → tools (например {\"websearch\": false}).\n" +
                             "Свои провайдеры: opencode.json → provider (baseURL, apiKey, models) — модель вида provider/model возьмёт их. Каталог моделей: /models dev.\n" +
-                            "Форматтеры: opencode.json → formatter ({\"prettier\": {\"command\": [\"npx\",\"prettier\",\"--write\",\"\$FILE\"]}}) — запускаются после записи файла.\n" +
+                            "Форматтеры: opencode.json → formatter ({\"prettier\": {\"command\": [\"npx\",\"prettier\",\"--write\",\"\$FILE\"]}}) — запускаются после записи файла. Prettier также подхватывается автоматически по конфигу.\n" +
+                            "@файл в сообщении подкладывает его содержимое агенту.\n" +
                             "Новое задание, пока агент занят, открывает отдельную сессию и выполняется параллельно — вкладки сверху.\n" +
                             "Навыки: создайте .opencode/skills/<имя>/SKILL.md (frontmatter: name, description) — агент подхватит и сможет загружать; глобальные — workspace/opencode/skills/.\n" +
                             "Инструкции: AGENTS.md в проекте + глобальный opencode/AGENTS.md, фолбэк CLAUDE.md; список файлов/URL — в opencode/opencode.json (\"instructions\").\n" +
@@ -631,7 +654,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
 
         // Commands that take arguments, plus custom commands from the config.
-        val parsed = Commands.parse(prompt)
+        val parsed = Commands.parse(showText)
         if (parsed != null) {
             val (name, args) = parsed
             when (name) {
@@ -658,6 +681,47 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     } else {
                         pushItem(AgentItem.Info("Сессия экспортирована: $path"))
                         shareFile(File(path))
+                    }
+                    return
+                }
+                "find" -> {
+                    ensureSession()
+                    val q = args.trim()
+                    if (q.isEmpty()) {
+                        pushItem(AgentItem.Info("Укажите текст: /find <текст>"))
+                        return
+                    }
+                    val hits = sessions.search(q)
+                    if (hits.isEmpty()) {
+                        pushItem(AgentItem.Info("Ничего не найдено по «$q»."))
+                    } else {
+                        val text = buildString {
+                            appendLine("Найдено по «$q»:")
+                            hits.take(20).forEach { h ->
+                                val snip = sessions.snippet(sessions.load(h.info.id)?.messages ?: org.json.JSONArray(), q, 80)
+                                appendLine("• ${h.info.title} (${h.count})${if (snip.isNotBlank()) "\n  $snip" else ""}")
+                            }
+                        }
+                        pushItem(AgentItem.Info(text.trimEnd()))
+                    }
+                    return
+                }
+                "import" -> {
+                    ensureSession()
+                    val arg = args.trim()
+                    if (arg.isEmpty()) {
+                        pushItem(AgentItem.Info("Укажите файл экспорта: /import <путь>. Файлы — workspace/opencode-data/exports/."))
+                        return
+                    }
+                    val base = _selected.value?.dir ?: workspace.root
+                    val f = File(arg).takeIf { it.isAbsolute } ?: workspace.resolve(arg, base) ?: File(base, arg)
+                    val session = sessions.import(f)
+                    if (session == null) {
+                        pushItem(AgentItem.Error("Не удалось импортировать сессию из ${f.path}."))
+                    } else {
+                        refreshSessions()
+                        switchTab(session.info.id)
+                        pushItem(AgentItem.Info("Сессия импортирована: ${session.info.title}"))
                     }
                     return
                 }
@@ -774,8 +838,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 val expanded = Commands.expand(custom, args, _selected.value?.dir)
                 lastPrompt = expanded
                 val display = "/$name${if (args.isBlank()) "" else " $args"}"
-                runFor(info).messages.update { it + AgentItem.User(display) }
-                runAgentTurn(expanded, info)
+                runAgentTurn(expanded, info, display = display)
                 return
             }
         }
@@ -787,16 +850,36 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             val info = ensureSession()
             val agentInfo = if (info.id == active.id) createSession() else info
             if (!requireConfigured()) return
-            lastPrompt = prompt
-            runFor(agentInfo).messages.update { it + AgentItem.User(prompt) }
-            runAgentTurn(prompt, agentInfo)
+            lastPrompt = showText
+            runAgentTurn(sendText, agentInfo, display = showText)
         } else {
             val info = ensureSession()
             if (!requireConfigured()) return
-            lastPrompt = prompt
-            runFor(info).messages.update { it + AgentItem.User(prompt) }
-            runAgentTurn(prompt, info)
+            lastPrompt = showText
+            runAgentTurn(sendText, info, display = showText)
         }
+    }
+
+    /**
+     * Expands `@path` mentions in a prompt: each matching project file's
+     * contents is appended so the agent sees it, while the chat still shows the
+     * short prompt the user typed.
+     */
+    private fun expandMentions(prompt: String): Pair<String, String> {
+        if (prompt.startsWith("/")) return prompt to prompt
+        val projectDir = _selected.value?.dir ?: return prompt to prompt
+        val regex = Regex("@([A-Za-z0-9_./\\-]+)")
+        val notes = mutableListOf<String>()
+        for (m in regex.findAll(prompt)) {
+            val path = m.groupValues[1]
+            val f = listOf(File(projectDir, path), workspace.resolve(path, projectDir) ?: File(projectDir, path))
+                .firstOrNull { it.isFile && workspace.isInside(it) }
+                ?: continue
+            val text = runCatching { f.readText(Charsets.UTF_8) }.getOrNull()?.take(20_000) ?: continue
+            notes += "Файл ${workspace.relativeTo(f)}:\n$text"
+        }
+        if (notes.isEmpty()) return prompt to prompt
+        return (prompt + "\n\n" + notes.joinToString("\n\n")) to prompt
     }
 
     /** Re-runs the last prompt (shown next to errors). */
@@ -806,8 +889,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         activeRun.value?.let { if (it.running.value) return }
         val info = ensureSession()
         if (!requireConfigured()) return
-        runFor(info).messages.update { it + AgentItem.User("$p (повтор)") }
-        runAgentTurn(p, info)
+        runAgentTurn(p, info, display = "$p (повтор)")
     }
 
     /**
@@ -818,8 +900,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         activeRun.value?.let { if (it.running.value) return }
         val info = ensureSession()
         if (!requireConfigured()) return
-        runFor(info).messages.update { it + AgentItem.User("/continue") }
-        runAgentTurn(OpenCodeAgent.CONTINUE_PROMPT, info)
+        runAgentTurn(OpenCodeAgent.CONTINUE_PROMPT, info, display = "/continue")
     }
 
     private fun requireConfigured(): Boolean {
@@ -840,7 +921,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      * (one thread each); a session that is already running refuses a second
      * turn so its history cannot be written from two places at once.
      */
-    private fun runAgentTurn(userText: String, info: Sessions.SessionInfo) {
+    private fun runAgentTurn(userText: String, info: Sessions.SessionInfo, display: String? = null) {
         val config = _llmConfig.value
         if (!config.isReady) return
         val run = runFor(info)
@@ -850,9 +931,13 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         run.rounds.value = 0
         run.preview.value = ""
         run.startedAt.value = System.currentTimeMillis()
-        run.turnSnapshots.clear()
-        run.turnCreated.clear()
-        run.turnFiles.clear()
+        // Capture the boundary for /undo before the turn touches anything.
+        val change = Change().apply {
+            history = run.history
+            messages = run.messages.value
+        }
+        run.pendingChange = change
+        run.messages.update { it + AgentItem.User(display ?: userText) }
         persistAgentUi()
 
         agentExecutor.execute {
@@ -866,11 +951,36 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 run.pendingQuestion.value = null
                 run.pendingApproval.value = null
                 run.running.value = false
+                commitChange(run)
+                // Top-level turns only: a subagent's result is returned inline.
+                dev.pocketrun.agent.TurnNotifier.notifyTurnFinished(getApplication(), info.title, "Агент завершил ход.")
                 // The agent writes files itself; the tree must not wait for the
                 // next poll to show what it did.
                 agentTouchedFiles()
             }
         }
+    }
+
+    /** Pushes the finished turn onto the undo stack (dropping any redo tail). */
+    private fun commitChange(run: SessionRun) {
+        val change = run.pendingChange ?: return
+        run.pendingChange = null
+        // A turn that neither changed files nor the conversation is not a step.
+        if (change.files.isEmpty() && run.history.length() == change.history.length()) return
+        synchronized(run) {
+            run.undoStack.addLast(change)
+            if (run.undoStack.size > MAX_UNDO) run.undoStack.removeFirst()
+            run.redoStack.clear()
+        }
+    }
+
+    /** Writes an undone/redone conversation back to the session file. */
+    private fun persistRunConversation(run: SessionRun) {
+        val session = sessions.load(run.id) ?: return
+        session.messages = run.history
+        sessions.save(session)
+        refreshSessions()
+        persistAgentUi()
     }
 
     /**
@@ -897,10 +1007,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         // configured provider's own endpoint and key.
         val effectiveModel = agentDef?.model ?: config.model
         val provider = cfg.providerFor(effectiveModel)
+        val providerKey = provider?.apiKey?.takeIf { it.isNotBlank() }
+            ?: OpenCodeConfig.readAuthTokens(workspace.root)[provider?.id ?: effectiveModel.substringBefore('/', "")]
         val effective = config.copy(
             model = effectiveModel,
             baseUrl = provider?.baseUrl ?: config.baseUrl,
-            apiKey = provider?.apiKey?.takeIf { it.isNotBlank() } ?: config.apiKey,
+            apiKey = providerKey ?: config.apiKey,
             temperature = agentDef?.temperature ?: config.temperature,
             topP = agentDef?.topP ?: config.topP,
             maxOutputTokens = agentDef?.maxOutputTokens ?: config.maxOutputTokens,
@@ -917,17 +1029,19 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         // Permission gate built from opencode.json; the mode is only a fallback.
         tools.permissionResolver = { name, argsJson ->
             val args = org.json.JSONObject(argsJson.ifBlank { "{}" })
-            cfg.permissionFor(name, OpenCodeConfig.keyArgFor(name, args))
-                ?: if (tools.isReadOnly(name, args) || subagent != null) OpenCodeConfig.Permission.ALLOW
+            val keyArg = OpenCodeConfig.keyArgFor(name, args)
+            cfg.permissionFor(name, keyArg)
+                ?: if (isAlwaysAllowed(name, keyArg)) OpenCodeConfig.Permission.ALLOW
+                else if (tools.isReadOnly(name, args) || subagent != null) OpenCodeConfig.Permission.ALLOW
                 else if (config.confirmMode == AgentSettings.MODE_MANUAL) OpenCodeConfig.Permission.ASK
                 else OpenCodeConfig.Permission.ALLOW
         }
         // Snapshot each file before the agent changes it, for /undo.
         tools.onBeforeWrite = { file -> recordTurnFile(run, file, projectDir) }
-        tools.formatters = cfg.formatters
+        tools.formatters = cfg.formatters + cfg.autoFormatters(projectDir, File(workspace.root, "opencode"))
         if (subagent == null) {
             // Only top-level agents spawn subagents; nesting stays impossible.
-            tools.subagentRunner = { request -> runSubagent(info, request, config) }
+            tools.subagentRunner = { request -> runSubagent(info, request, config, run) }
         }
         val agent = OpenCodeAgent(
             workspace, tools, { LlmClient(effective) }, projectDir,
@@ -951,6 +1065,14 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         tools.todos = run.todos.value
         // A waiting tool (github run_wait) must notice ⏹ as well.
         tools.cancelCheck = { run.cancelled.get() }
+
+        if (subagent == null) {
+            // Keep the context in view, and squeeze it before it overflows.
+            run.context.value = estimatedTokens(run.history)
+            if (run.history.length() > 1 && run.context.value >= compactLimitTokens) {
+                autoCompact(run, info, effective)
+            }
+        }
 
         val newHistory = agent.run(userText, run.history) { event -> handleEvent(run, config, event) }
 
@@ -1037,8 +1159,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private fun askApproval(run: SessionRun, name: String, argsJson: String): Boolean {
         val latch = CountDownLatch(1)
         var approved = false
-        run.pendingApproval.value = PendingApproval(name, argsJson.take(300)) { ok ->
-            approved = ok
+        val keyArg = OpenCodeConfig.keyArgFor(name, org.json.JSONObject(argsJson.ifBlank { "{}" }))
+        run.pendingApproval.value = PendingApproval(name, argsJson.take(300)) { allow, always ->
+            approved = allow
+            if (allow && always) AgentSettings.rememberApproval(getApplication(), "$name::$keyArg")
             run.pendingApproval.value = null
             latch.countDown()
         }
@@ -1047,6 +1171,16 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         } else {
             run.pendingApproval.value = null
             false
+        }
+    }
+
+    /** True when the user chose "always allow" for this tool/argument pattern. */
+        /** Self-facing extension: needed for always-allow strings. */
+    private fun isAlwaysAllowed(name: String, keyArg: String): Boolean {
+        val tool = name.trim()
+        return AgentSettings.approvedRules(getApplication()).any { rule ->
+            val (rtool, rpattern) = rule.split("::", limit = 2).let { it[0] to it.getOrElse(1) { "*" } }
+            rtool == tool && OpenCodeConfig.globMatches(rpattern, keyArg)
         }
     }
 
@@ -1059,6 +1193,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         parent: Sessions.SessionInfo,
         request: OpenCodeTools.TaskRequest,
         config: AgentSettings.Config,
+        parentRun: SessionRun,
     ): String {
         val child = sessions.create(
             project = parent.project,
@@ -1067,6 +1202,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             model = config.model,
         )
         val childRun = SessionRun(child.info.id, projectDirFor(child.info))
+        // A subagent's file writes belong to the parent turn's undo step.
+        childRun.undoTarget = parentRun
         _runs.update { it + (child.info.id to childRun) }
         childRun.history = child.messages
         childRun.messages.value = historyToItems(child.messages)
@@ -1107,89 +1244,102 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     /**
      * Remembers a file's state before the agent changes it, so `/undo` can put
      * it back. Only the first touch of a turn is recorded: that is the state
-     * the turn started from.
+     * the turn started from. A subagent's writes land in the parent's step.
      */
     private fun recordTurnFile(run: SessionRun, file: File, projectDir: File?) {
         val dir = projectDir ?: return
+        val target = run.undoTarget ?: run
+        val change = target.pendingChange ?: return
         val key = runCatching { file.canonicalPath }.getOrElse { file.absolutePath }
-        if (!run.turnFiles.add(key)) return
-        if (file.isFile) {
-            history.snapshot(file, dir)?.let { run.turnSnapshots += file to it }
-        } else {
-            run.turnCreated += file
-        }
+        if (!change.keys.add(key)) return
+        val version = if (file.isFile) history.snapshot(file, dir) else null
+        change.files += FileState(file, version)
     }
 
-    /** `/undo`: reverts every file the last turn changed (write/edit/apply_patch). */
+    /**
+     * `/undo`: reverts the last step — its files and its conversation — and
+     * makes it available to `/redo`. Repeatable for as many steps as ran.
+     */
     fun undoLastTurn() {
         val run = activeRun.value ?: return
         if (run.running.value) {
             pushItem(AgentItem.Info("Агент ещё работает — сначала остановите ход (⏹)."))
             return
         }
-        val projectDir = run.projectDir ?: _selected.value?.dir
-        if (projectDir == null) return
-        if (run.turnSnapshots.isEmpty() && run.turnCreated.isEmpty()) {
-            pushItem(AgentItem.Info("Нечего отменять: в последнем ходе агент не менял файлы через write/edit/apply_patch (/undo не покрывает изменения, сделанные произвольным bash)."))
+        val change = synchronized(run) { run.undoStack.removeLastOrNull() }
+        if (change == null) {
+            pushItem(AgentItem.Info("Нечего отменять."))
             return
         }
-        val names = mutableListOf<String>()
-        run.redoSnapshots.clear()
-        run.redoCreated.clear()
-        run.turnSnapshots.asReversed().forEach { (file, version) ->
-            if (file.isFile) history.snapshot(file, projectDir)?.let { run.redoSnapshots += file to it }
-            if (history.restore(version, file, projectDir)) names += workspace.relativeTo(file)
+        val projectDir = run.projectDir ?: _selected.value?.dir
+        if (projectDir == null) return
+        val (names, inverse) = applyChange(run, change, projectDir)
+        persistRunConversation(run)
+        synchronized(run) {
+            run.redoStack.addLast(inverse)
+            if (run.redoStack.size > MAX_UNDO) run.redoStack.removeFirst()
         }
-        run.turnCreated.reversed().forEach { f ->
-            if (f.isFile) {
-                runCatching { run.redoCreated += f to f.readText(Charsets.UTF_8) }
-                if (f.delete()) names += "-${workspace.relativeTo(f)}"
-            }
-        }
-        run.turnSnapshots.clear()
-        run.turnCreated.clear()
-        run.turnFiles.clear()
         agentTouchedFiles()
         pushItem(
             AgentItem.Info(
-                if (names.isEmpty()) "Не удалось отменить изменения."
-                else "Отменено в последнем ходе:\n" + names.distinct().joinToString("\n") { "• $it" } + "\nВернуть: /redo",
+                if (names.isEmpty()) "Шаг отменён."
+                else "Отменено:\n" + names.joinToString("\n") { "• $it" } + "\nВернуть: /redo",
             ),
         )
     }
 
-    /** `/redo`: re-applies the changes the last `/undo` reverted. */
+    /** `/redo`: re-applies the step the last `/undo` reverted. */
     fun redoLastTurn() {
         val run = activeRun.value ?: return
         if (run.running.value) {
             pushItem(AgentItem.Info("Агент ещё работает — сначала остановите ход (⏹)."))
             return
         }
-        val projectDir = run.projectDir ?: _selected.value?.dir
-        if (projectDir == null) return
-        if (run.redoSnapshots.isEmpty() && run.redoCreated.isEmpty()) {
+        val change = synchronized(run) { run.redoStack.removeLastOrNull() }
+        if (change == null) {
             pushItem(AgentItem.Info("Нечего возвращать: сначала отмените изменения через /undo."))
             return
         }
-        val names = mutableListOf<String>()
-        run.redoSnapshots.asReversed().forEach { (file, version) ->
-            if (file.isFile) history.snapshot(file, projectDir)?.let { run.turnSnapshots += file to it } else run.turnCreated += file
-            if (history.restore(version, file, projectDir)) names += workspace.relativeTo(file)
+        val projectDir = run.projectDir ?: _selected.value?.dir
+        if (projectDir == null) return
+        val (names, inverse) = applyChange(run, change, projectDir)
+        persistRunConversation(run)
+        synchronized(run) {
+            run.undoStack.addLast(inverse)
+            if (run.undoStack.size > MAX_UNDO) run.undoStack.removeFirst()
         }
-        run.redoCreated.asReversed().forEach { (f, content) ->
-            if (f.isFile) history.snapshot(f, projectDir)?.let { run.turnSnapshots += f to it } else run.turnCreated += f
-            runCatching { f.parentFile?.mkdirs(); f.writeText(content, Charsets.UTF_8); names += workspace.relativeTo(f) }
-        }
-        run.redoSnapshots.clear()
-        run.redoCreated.clear()
-        run.turnFiles.clear()
         agentTouchedFiles()
         pushItem(
             AgentItem.Info(
-                if (names.isEmpty()) "Не удалось вернуть изменения."
-                else "Возвращено:\n" + names.distinct().joinToString("\n") { "• $it" },
+                if (names.isEmpty()) "Нечего возвращать."
+                else "Возвращено:\n" + names.joinToString("\n") { "• $it" },
             ),
         )
+    }
+
+    /**
+     * Moves the session to [change]'s state (files + conversation) and returns
+     * the touched names plus the inverse change that would move it back.
+     */
+    private fun applyChange(run: SessionRun, change: Change, projectDir: File): Pair<List<String>, Change> {
+        val names = mutableListOf<String>()
+        val inverse = Change().apply {
+            history = run.history
+            messages = run.messages.value
+        }
+        for (fs in change.files) {
+            // Remember the current state so the inverse can restore it.
+            if (fs.file.isFile) history.snapshot(fs.file, projectDir)?.let { inverse.files += FileState(fs.file, it) }
+            else inverse.files += FileState(fs.file, null)
+            if (fs.version != null) {
+                if (history.restore(fs.version, fs.file, projectDir)) names += workspace.relativeTo(fs.file)
+            } else if (fs.file.exists() && fs.file.deleteRecursively()) {
+                names += "-${workspace.relativeTo(fs.file)}"
+            }
+        }
+        run.history = change.history
+        run.messages.value = change.messages
+        return names.distinct() to inverse
     }
 
     /**
@@ -1262,6 +1412,53 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             }
         }
     }.trim()
+
+    /** Rough token estimate of a history: its characters, plus prompt/tool overhead. */
+    private fun estimatedTokens(history: JSONArray): Int =
+        dev.pocketrun.agent.opencode.HistoryTrimmer.estimateTokens(history) + CONTEXT_OVERHEAD_TOKENS
+
+    private val compactLimitTokens: Int get() = (CONTEXT_WINDOW_TOKENS * AUTO_COMPACT_RATIO).toInt()
+
+    /**
+     * `/compact`, but automatic: called on the agent thread when a turn would
+     * blow the context window. Rewrites the history to a summary and keeps the
+     * undo boundary pointing at it, so undo still works after compaction.
+     */
+    private fun autoCompact(run: SessionRun, info: Sessions.SessionInfo, effective: AgentSettings.Config): Boolean {
+        val transcript = historyText(run.history)
+        if (transcript.isBlank()) return false
+        val summary = runCatching {
+            val request = JSONArray()
+                .put(
+                    JSONObject().put("role", "system").put(
+                        "content",
+                        "You compress a coding-agent conversation into a dense handoff summary. " +
+                            "Keep: the user's goal, decisions made, files touched and their current state, " +
+                            "commands run and their results, open questions and the exact next steps. " +
+                            "No pleasantries, no repetition — just the facts another agent needs to continue.",
+                    ),
+                )
+                .put(JSONObject().put("role", "user").put("content", transcript))
+            LlmClient(effective).chat(request, null).content.orEmpty().trim()
+        }.getOrDefault("")
+        if (summary.isBlank()) return false
+        val compacted = JSONArray().put(
+            JSONObject().put("role", "user")
+                .put("content", "Конспект предыдущей работы (контекст сжат автоматически):\n" + summary),
+        )
+        run.history = compacted
+        run.pendingChange?.history = compacted
+        run.pendingChange?.messages = run.messages.value
+        run.context.value = estimatedTokens(compacted)
+        val session = sessions.load(info.id)
+        if (session != null) {
+            session.messages = compacted
+            sessions.save(session)
+            if (_currentSession.value?.id == info.id) _currentSession.value = session.info
+        }
+        run.messages.update { it + AgentItem.Info("Контекст сжат автоматически — достигнут лимит окна.") }
+        return true
+    }
 
     // ---------------------------------------------------------------- tabs
 
@@ -2177,6 +2374,18 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
         /** How many sessions may run turns at the same time. */
         private const val MAX_PARALLEL_TURNS = 4
+
+        /** How many undo steps a session keeps (and how deep redo can go). */
+        private const val MAX_UNDO = 50
+
+        /** Rough model context window used for the fill bar and auto-compaction. */
+        const val CONTEXT_WINDOW_TOKENS = 128_000
+
+        /** Squeeze the history once it reaches this share of the window. */
+        const val AUTO_COMPACT_RATIO = 0.75
+
+        /** Tokens charged for the system prompt and the tool schemas on top of the history. */
+        const val CONTEXT_OVERHEAD_TOKENS = 2_000
 
         /** How often the project folder is checked for changes made elsewhere. */
         private const val WATCH_INTERVAL_MS = 2_000L

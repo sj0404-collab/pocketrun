@@ -128,4 +128,28 @@ object AgentSettings {
             .putString("uiOpenTabs", openTabs.joinToString(","))
             .apply()
     }
+
+    /**
+     * Tools/argument patterns the user chose "always allow" for, as
+     * `tool::glob` strings. They win over the ask/manual confirmation.
+     */
+    fun approvedRules(context: Context): Set<String> =
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getStringSet("approvedRules", emptySet())?.toSet() ?: emptySet()
+
+    fun rememberApproval(context: Context, rule: String) {
+        val current = approvedRules(context)
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .edit()
+            .putStringSet("approvedRules", current + rule)
+            .apply()
+    }
+
+    fun forgetApproval(context: Context, rule: String) {
+        val current = approvedRules(context)
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .edit()
+            .putStringSet("approvedRules", current - rule)
+            .apply()
+    }
 }

@@ -35,7 +35,7 @@ object HistoryTrimmer {
      * message) with the oldest, bulkiest parts removed. Returns the very same
      * array when nothing needs trimming.
      */
-    fun trim(messages: JSONArray, maxChars: Int = DEFAULT_MAX_CHARS, toolKeep: Int = TOOL_KEEP): JSONArray {
+        fun trim(messages: JSONArray, maxChars: Int = DEFAULT_MAX_CHARS, toolKeep: Int = TOOL_KEEP): JSONArray {
         if (messages.length() <= 2) return messages
         val blocks = blocks(messages)
         // A history with an orphan `tool` message has to be rebuilt even when it
@@ -120,7 +120,12 @@ object HistoryTrimmer {
         return copy
     }
 
-    private fun sizeOf(messages: JSONArray): Int {
+        /** A token estimate of [messages]: four characters per token, the standard rough proxy. */
+        fun estimateTokens(messages: JSONArray): Int = sizeOf(messages) / CHARS_PER_TOKEN
+
+        private const val CHARS_PER_TOKEN = 4
+
+        private fun sizeOf(messages: JSONArray): Int {
         var total = 0
         for (i in 0 until messages.length()) total += messages.opt(i)?.toString()?.length ?: 0
         return total

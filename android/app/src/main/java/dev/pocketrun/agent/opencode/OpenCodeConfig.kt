@@ -108,20 +108,80 @@ class OpenCodeConfig private constructor(
     /** Tools disabled globally (`"tools": { "write": false }`). */
     fun disabledTools(): Set<String> = tools.filterValues { !it }.keys.map(::normalizeTool).toSet()
 
+        /**
+         * The provider a model belongs to: either an explicit `provider/model` id or
+         * a model listed under a provider. Null when nothing matches.
+         */
+        fun providerFor(model: String?): ProviderDef? {
+            if (model.isNullOrBlank()) return null
+            val prefix = model.substringBefore('/', "")
+            if (prefix.isNotEmpty()) providers[prefix]?.let { return it }
+            return providers.values.firstOrNull { p -> p.models.any { it == model || model.endsWith("/$it") } }
+        }
+
     /**
-     * The provider a model belongs to: either an explicit `provider/model` id or
-     * a model listed under a provider. Null when nothing matches.
+     * Formatters opencode picks up automatically. We run the JS ones (npx) when
+     * their config is present, mirroring opencode's discovery without plugins.
      */
-    fun providerFor(model: String?): ProviderDef? {
-        if (model.isNullOrBlank()) return null
-        val prefix = model.substringBefore('/', "")
-        if (prefix.isNotEmpty()) providers[prefix]?.let { return it }
-        return providers.values.firstOrNull { p -> p.models.any { it == model || model.endsWith("/$it") } }
+    fun autoFormatters(projectDir: File?, globalDir: File): List<FormatterDef> {
+        val out = mutableListOf<FormatterDef>()
+        val roots = listOfNotNull(projectDir, globalDir)
+        val prettierConfigs = listOf(
+            ".prettierrc", ".prettierrc.json", ".prettierrc.yaml", ".prettierrc.yml",
+            ".prettierrc.js", ".prettierrc.mjs", ".prettierrc.cjs", ".prettierrc.toml",
+            "prettier.config.js", "prettier.config.mjs", "prettier.config.cjs",
+        )
+        var hasPrettier = roots.any { r -> prettierConfigs.any { File(r, it).isFile } }
+        if (!hasPrettier) {
+            // A package.json that already depends on prettier counts too.
+            for (r in roots) {
+                val pj = File(r, "package.json")
+                if (!pj.isFile) continue
+                val json = readJson(pj) ?: continue
+                val deps = json.optJSONObject("devDependencies") ?: json.optJSONObject("dependencies")
+                if (deps?.has("prettier") == true) hasPrettier = true
+            }
+        }
+        if (hasPrettier) {
+            out += FormatterDef(
+                name = "prettier",
+                command = listOf("npx", "--yes", "prettier", "--write", "\$FILE"),
+                extensions = listOf(
+                    ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".css", ".scss",
+                    ".html", ".md", ".markdown", ".json", ".yaml", ".yml", ".vue",
+                ),
+            )
+        }
+        return out
     }
 
     companion object {
         /** Agent names that ship with the app (also valid `task` types). */
         val BUILTIN_AGENTS = listOf("build", "plan", "explore", "general")
+
+        /**
+         * Credentials opencode stored after `auth login`, at
+         * `<workspace>/opencode/auth.json`: `{ "<provider>": { "access_token": "..." } }`.
+         * Used as the API key when a configured provider carries none of its own.
+         */
+        fun readAuthTokens(workspaceRoot: File): Map<String, String> {
+            val f = File(File(workspaceRoot, "opencode"), "auth.json")
+            if (!f.isFile) return emptyMap()
+            return try {
+                val root = org.json.JSONObject(f.readText(Charsets.UTF_8))
+                val out = LinkedHashMap<String, String>()
+                val keys = root.keys()
+                while (keys.hasNext()) {
+                    val id = keys.next()
+                    val entry = root.optJSONObject(id) ?: continue
+                    val token = entry.optString("access_token").takeIf { it.isNotBlank() }
+                    if (token != null) out[id] = token
+                }
+                out
+            } catch (t: Throwable) {
+                emptyMap()
+            }
+        }
 
         private val TOOL_ALIASES = mapOf(
             "edit" to "edit", "write" to "write", "patch" to "apply_patch",
